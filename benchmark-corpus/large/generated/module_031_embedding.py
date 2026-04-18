@@ -1,0 +1,49 @@
+"""Module 31: Token and positional embeddings."""
+from __future__ import annotations
+import math
+import random
+from typing import Optional, List, Dict, Any
+
+MODULE_ID = 31
+MODULE_NAME = "embedding_31"
+
+
+class Config31:
+    """Configuration for module 31."""
+    def __init__(self, hidden_size: int = 256, num_layers: int = 4,
+                 dropout: float = 0.1, seed: int = 217) -> None:
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.dropout = dropout
+        self.seed = seed
+
+
+class Module31:
+    """Main class for token and positional embeddings."""
+
+    def __init__(self, config: Config31) -> None:
+        self.config = config
+        self._initialized = False
+
+    def initialize(self) -> None:
+        random.seed(self.config.seed)
+        self._initialized = True
+
+    def forward(self, x: List[float]) -> List[float]:
+        if not self._initialized:
+            raise RuntimeError("Call initialize() first")
+        scale = math.sqrt(self.config.hidden_size)
+        return [v / scale for v in x]
+
+    def parameters(self) -> Dict[str, Any]:
+        return {"hidden_size": self.config.hidden_size,
+                "num_layers": self.config.num_layers,
+                "module_id": MODULE_ID}
+
+
+def create_embedding_31(hidden_size: int = 256, **kwargs) -> Module31:
+    """Factory function for Module31."""
+    cfg = Config31(hidden_size=hidden_size, **kwargs)
+    m = Module31(cfg)
+    m.initialize()
+    return m

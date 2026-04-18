@@ -1,0 +1,13 @@
+# Generated outputs — don't commit
+graphify-out/
+benchmark-results/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Secrets
+.env

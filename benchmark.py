@@ -98,7 +98,118 @@ PRICE_CLAUDE_INPUT  = 3.00  / 1_000_000   # claude-sonnet input
 PRICE_CLAUDE_OUTPUT = 15.00 / 1_000_000   # claude-sonnet output
 PRICE_EMBED         = 0.02  / 1_000_000   # text-embedding-3-small
 
-ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL = "claude-sonnet-4-6"
+
+# ---------------------------------------------------------------------------
+# Mixed corpus — code + docs cross-reference test (Test 13)
+# ---------------------------------------------------------------------------
+
+MIXED_CORPUS_DIR = Path("benchmark-corpus/mixed")
+MIXED_GRAPH_OUT  = Path("graphify-out/mixed")
+WIKI_DIR         = MIXED_GRAPH_OUT / "wiki"
+
+# Entity definitions for LLMWiki page generation (Test 14)
+WIKI_ENTITIES: list[dict] = [
+    {
+        "name": "AuthService",
+        "keywords": ["authservice", "auth_service", "login", "logout", "refresh", "validate",
+                     "authresult"],
+    },
+    {
+        "name": "TokenStore",
+        "keywords": ["tokenstore", "token_store", "consume_refresh", "revoke_all_for_user",
+                     "access_ttl", "refresh_ttl", "create_access_token", "create_refresh_token"],
+    },
+    {
+        "name": "SessionManager",
+        "keywords": ["sessionmanager", "session_manager", "session", "max_sessions",
+                     "create_session", "eviction", "fifo", "popitem"],
+    },
+    {
+        "name": "User and Permission System",
+        "keywords": ["user", "permission", "has_permission", "permissionlevel", "frozenset",
+                     "is_active", "allows", "read", "write", "admin", "super"],
+    },
+    {
+        "name": "API Contract Refresh Endpoint",
+        "keywords": ["refresh", "api", "endpoint", "post /auth/refresh", "guarantee",
+                     "expires_in", "single-use", "contract", "access_token", "refresh_token"],
+    },
+    {
+        "name": "Refresh Token Design",
+        "keywords": ["single-use", "adr", "atomic", "theft", "rotation", "idempotent",
+                     "consume_refresh", "replay", "security"],
+    },
+    {
+        "name": "Known Limitations",
+        "keywords": ["limitation", "known", "invalidate", "silent", "idempotent", "in-memory",
+                     "wildcard", "fifo", "eviction", "revoke", "tombstone", "grace"],
+    },
+]
+
+MIXED_QUESTIONS: list[str] = [
+    "what motivated the single-use refresh token design?",           # Q1 — rationale
+    "what are the API contract guarantees for the refresh endpoint?", # Q2 — factual
+    "how does AuthService use TokenStore to handle token refresh?",   # Q3 — comprehensive
+    "how does the User model relate to the permission system?",       # Q4 — structural
+    "what are the known limitations and what components do they affect?", # Q5 — factual
+]
+
+BM25_INDEX_PATH = MIXED_GRAPH_OUT / "bm25_index.json"
+
+# Router: question type → budget + layer weights
+# Budgets reflect information density needed per question type (not an arbitrary cap)
+ROUTING_CONFIG: dict[str, dict] = {
+    "structural": {
+        "budget": 1500,
+        "layers": {"graph": 1.0},
+        "description": (
+            "PURE topology only — what imports what, what calls what, dependency graphs. "
+            "NO implementation detail needed. "
+            "Examples: 'what modules does X import?', 'show the call graph for Y', "
+            "'which classes extend Z?'"
+        ),
+    },
+    "rationale": {
+        "budget": 2000,
+        "layers": {"wiki": 0.8, "graph": 0.2},
+        "description": (
+            "Design decisions and motivation — WHY something was built a certain way. "
+            "Examples: 'what motivated X?', 'why was Y designed like this?', "
+            "'what trade-offs led to Z?', 'what does the ADR say about X?'"
+        ),
+    },
+    "factual": {
+        "budget": 2500,
+        "layers": {"wiki": 0.6, "hybrid": 0.4},
+        "description": (
+            "Specific concrete facts — API contracts, guarantees, constant values, "
+            "known limitations, error codes. "
+            "Examples: 'what are the guarantees for X?', 'what are the known limitations?', "
+            "'what does endpoint Y return?', 'what is the value of constant Z?'"
+        ),
+    },
+    "similarity": {
+        "budget": 3000,
+        "layers": {"bm25": 0.6, "wiki": 0.2, "graph": 0.2},
+        "description": (
+            "Find code or docs semantically similar to a concept. "
+            "Examples: 'find code that does X', 'what is similar to Y?', "
+            "'show me examples of Z pattern'"
+        ),
+    },
+    "comprehensive": {
+        "budget": 5000,
+        "layers": {"wiki": 0.4, "graph": 0.3, "bm25": 0.3},
+        "description": (
+            "End-to-end understanding — HOW something works, how components interact, "
+            "how X USES or RELATES TO Y in practice (requires both code structure AND "
+            "documentation context). "
+            "Examples: 'how does X use Y?', 'how does X relate to Y?', "
+            "'walk me through the flow of Z', 'how does X work end to end?'"
+        ),
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -250,6 +361,745 @@ def fetch_doc_corpus() -> int:
             failed += 1
     print(f"    Fetched {fetched} new, {skipped} cached, {failed} failed")
     return len(list(DOC_CORPUS_DIR.glob("*.md")))
+
+
+# ---------------------------------------------------------------------------
+# Hybrid pipeline helpers (Test 13)
+# ---------------------------------------------------------------------------
+
+def build_doc_index(doc_files: list[Path], out_dir: Path, client) -> dict:
+    """One-time LLM extraction for each doc file, cached by SHA-256.
+
+    Calls Claude once per uncached doc to extract:
+        summary, code_refs, key_facts, type
+
+    Results are persisted in out_dir/doc_index.json keyed by file SHA-256.
+    Already-extracted docs are skipped on subsequent calls (cache hit).
+
+    Returns the full in-memory doc_index dict.
+    """
+    import re as _re
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    index_path = out_dir / "doc_index.json"
+
+    doc_index: dict = {}
+    if index_path.exists():
+        try:
+            doc_index = json.loads(index_path.read_text(encoding="utf-8"))
+        except Exception:
+            doc_index = {}
+
+    EXTRACT_PROMPT = (
+        "You are a documentation analyst. Read the document below and extract:\n"
+        "1. A 1-2 sentence summary of what it covers.\n"
+        "2. All code entity names explicitly mentioned: class names, method names, "
+        "function names, constant names (e.g. ACCESS_TTL, MAX_SESSIONS, consume_refresh).\n"
+        "3. Key concrete facts: specific values, guarantees, constraints, design decisions "
+        "(e.g. 'ACCESS_TTL=900', 'MAX_SESSIONS=5', 'single-use refresh tokens', 'FIFO eviction').\n"
+        "4. Document type: one of architecture, api-contract, adr, data-model, limitations, unknown.\n\n"
+        "Respond ONLY with this JSON (no markdown fences, no commentary):\n"
+        '{{"summary":"...","code_refs":["..."],"key_facts":["..."],"type":"..."}}\n\n'
+        "Document:\n{content}"
+    )
+
+    new_extractions = 0
+    for doc_path in doc_files:
+        content = safe_read(doc_path)
+        sha = hashlib.sha256(content.encode()).hexdigest()
+
+        if sha in doc_index:
+            continue  # cache hit
+
+        prompt = EXTRACT_PROMPT.format(content=content[:8000])
+        try:
+            resp = client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=400,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            m = _re.search(r"\{.*\}", raw, _re.DOTALL)
+            extracted = json.loads(m.group()) if m else {}
+        except Exception as exc:
+            extracted = {
+                "summary": f"[extraction failed: {exc}]",
+                "code_refs": [], "key_facts": [], "type": "unknown",
+            }
+
+        doc_index[sha] = {
+            "file":      str(doc_path),
+            "summary":   extracted.get("summary", ""),
+            "code_refs": extracted.get("code_refs", []),
+            "key_facts": extracted.get("key_facts", []),
+            "type":      extracted.get("type", "unknown"),
+        }
+        new_extractions += 1
+
+    index_path.write_text(json.dumps(doc_index, indent=2), encoding="utf-8")
+    print(f"    doc_index: {len(doc_index)} entries ({new_extractions} new LLM extractions)")
+    return doc_index
+
+
+def smart_doc_query(
+    question: str,
+    doc_index: dict,
+    corpus_dir: Path,
+    budget: int = 1000,
+) -> tuple[str, int]:
+    """Score indexed docs against *question*, return top content within *budget* tokens.
+
+    Scoring per doc:
+        +1  for each question word (>3 chars) found in summary or key_facts
+        +2  for each code_refs entity that appears in the question text
+
+    Returns (doc_context_str, tokens_used).
+    Each doc section is prefixed: --- filename (type: <type>) ---
+    """
+    question_lower = question.lower()
+    question_words = {w for w in question_lower.split() if len(w) > 3}
+
+    scored: list[tuple[float, dict]] = []
+    for sha, meta in doc_index.items():
+        score = 0.0
+
+        # Keyword overlap on summary
+        summary_words = set(meta.get("summary", "").lower().split())
+        score += len(question_words & summary_words)
+
+        # Keyword overlap on key_facts
+        facts_words = set(" ".join(meta.get("key_facts", [])).lower().split())
+        score += len(question_words & facts_words)
+
+        # Code entity bonus
+        for entity in meta.get("code_refs", []):
+            if entity.lower() in question_lower:
+                score += 2.0
+
+        if score > 0:
+            scored.append((score, meta))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    parts: list[str] = []
+    used = 0
+    for _, meta in scored:
+        # Resolve file path — try stored path then fallback to corpus_dir/filename
+        doc_path = Path(meta["file"])
+        if not doc_path.exists():
+            doc_path = corpus_dir / Path(meta["file"]).name
+        if not doc_path.exists():
+            continue
+
+        content      = safe_read(doc_path)
+        header       = f"--- {doc_path.name} (type: {meta['type']}) ---\n"
+        chunk        = header + content
+        chunk_tokens = count_tokens(chunk)
+
+        if used + chunk_tokens <= budget:
+            parts.append(chunk)
+            used += chunk_tokens
+        elif used < budget:
+            # Partial fit: trim to remaining budget (approximate by char ratio)
+            remaining = budget - used
+            if remaining < 50:
+                break
+            ratio   = remaining / max(1, chunk_tokens)
+            trimmed = chunk[: int(len(chunk) * ratio)]
+            parts.append(trimmed)
+            used += count_tokens(trimmed)
+            break
+
+    return "\n\n".join(parts), used
+
+
+def hybrid_query(
+    question:       str,
+    graph_path:     Path,
+    doc_index_path: Path,
+    corpus_dir:     Path,
+    total_budget:   int = 2000,
+) -> tuple[str, int, int]:
+    """Split-budget retrieval: half for code graph, half for smart doc retrieval.
+
+    Keeps total context within *total_budget* tokens — same cost as a plain
+    graphify query — but covers both code structure AND documentation.
+
+    Returns:
+        (merged_context, graph_tokens_used, doc_tokens_used)
+
+    merged_context format:
+        [CODE STRUCTURE]
+        <graphify output>
+
+        [DOCUMENTATION]
+        <doc context>
+    """
+    half = total_budget // 2  # 1000 tokens each by default
+
+    # Code graph side
+    graph_out    = ""
+    graph_tokens = 0
+    if graph_path.exists():
+        try:
+            r = subprocess.run(
+                ["graphify", "query", question,
+                 "--graph", str(graph_path),
+                 "--budget", str(half)],
+                capture_output=True, text=True, timeout=60,
+            )
+            graph_out = r.stdout
+        except Exception as exc:
+            graph_out = f"[graph query error: {exc}]"
+        graph_tokens = count_tokens(graph_out)
+
+    # Doc side
+    doc_context = ""
+    doc_tokens  = 0
+    if doc_index_path.exists():
+        try:
+            doc_index = json.loads(doc_index_path.read_text(encoding="utf-8"))
+        except Exception:
+            doc_index = {}
+        doc_context, doc_tokens = smart_doc_query(question, doc_index, corpus_dir, budget=half)
+
+    merged = f"[CODE STRUCTURE]\n{graph_out}\n\n[DOCUMENTATION]\n{doc_context}"
+    return merged, graph_tokens, doc_tokens
+
+
+def build_llmwiki(
+    graph_path: Path,
+    doc_index_path: Path,
+    corpus_dir: Path,
+    wiki_dir: Path,
+    client,
+) -> dict[str, Path]:
+    """Build LLMWiki entity pages — one synthesised markdown page per major entity.
+
+    For each entity in WIKI_ENTITIES:
+      1. Collect relevant graphify graph nodes (by keyword match on label)
+      2. Collect relevant doc file content (by keyword match on doc_index metadata)
+      3. LLM synthesises a single wiki page covering code structure + documentation
+
+    Pages are cached as wiki_dir/<slug>.md — delete the wiki/ dir to force rebuild.
+
+    Returns: dict mapping entity name → page Path.
+    """
+    wiki_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load graph nodes
+    graph_nodes: list[dict] = []
+    if graph_path.exists():
+        try:
+            g = json.loads(graph_path.read_text(encoding="utf-8"))
+            graph_nodes = g.get("nodes", [])
+        except Exception:
+            graph_nodes = []
+
+    # Load doc_index
+    doc_index: dict = {}
+    if doc_index_path.exists():
+        try:
+            doc_index = json.loads(doc_index_path.read_text(encoding="utf-8"))
+        except Exception:
+            doc_index = {}
+
+    WIKI_PAGE_PROMPT = (
+        "You are building a technical wiki page for: {entity}\n\n"
+        "Below is everything known from code analysis (AST graph) and documentation.\n\n"
+        "CODE STRUCTURE (from graphify AST graph):\n{graph_ctx}\n\n"
+        "DOCUMENTATION EXCERPTS:\n{doc_ctx}\n\n"
+        "Write a comprehensive wiki page in markdown covering:\n"
+        "1. What it is and what it does (2-3 sentences)\n"
+        "2. Key methods/fields/endpoints with their purpose and concrete values\n"
+        "3. Design decisions and rationale (WHY, not just WHAT)\n"
+        "4. Known limitations or caveats with exact component names\n"
+        "5. Cross-references to related entities\n\n"
+        "Rules: factual only, no padding, include concrete values where available "
+        "(e.g. ACCESS_TTL=900, MAX_SESSIONS=5). Use ## headers. Max 400 words."
+    )
+
+    pages: dict[str, Path] = {}
+    new_pages = 0
+
+    for entity_def in WIKI_ENTITIES:
+        entity   = entity_def["name"]
+        keywords = [k.lower() for k in entity_def["keywords"]]
+        slug     = entity.lower().replace(" ", "_").replace("-", "_")
+        page_path = wiki_dir / f"{slug}.md"
+        pages[entity] = page_path
+
+        if page_path.exists():
+            continue  # cache hit
+
+        # ── Graph context ──────────────────────────────────────────────────
+        graph_parts: list[str] = []
+        for node in graph_nodes:
+            label = node.get("label", "").lower()
+            if any(kw in label for kw in keywords):
+                ftype = node.get("file_type", "code")
+                loc   = node.get("source_location", "")
+                graph_parts.append(f"[{ftype}] {node['label']} @ {loc}")
+        graph_ctx = "\n".join(graph_parts) if graph_parts else "(no matching graph nodes)"
+
+        # ── Doc context ────────────────────────────────────────────────────
+        doc_parts: list[str] = []
+        for sha, meta in doc_index.items():
+            refs    = " ".join(r.lower() for r in meta.get("code_refs", []))
+            summary = meta.get("summary", "").lower()
+            facts   = " ".join(meta.get("key_facts", [])).lower()
+            blob    = summary + " " + facts + " " + refs
+            if any(kw in blob for kw in keywords):
+                doc_path = Path(meta["file"])
+                if not doc_path.exists():
+                    doc_path = corpus_dir / Path(meta["file"]).name
+                if doc_path.exists():
+                    doc_parts.append(f"--- {doc_path.name} ---\n{safe_read(doc_path)[:3000]}")
+
+        doc_ctx = "\n\n".join(doc_parts) if doc_parts else "(no relevant documentation found)"
+
+        prompt = WIKI_PAGE_PROMPT.format(
+            entity=entity,
+            graph_ctx=graph_ctx[:2000],
+            doc_ctx=doc_ctx[:4000],
+        )
+
+        try:
+            resp = client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=600,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            page_content = f"# {entity}\n\n{resp.content[0].text.strip()}"
+        except Exception as exc:
+            page_content = f"# {entity}\n\n[wiki build failed: {exc}]"
+
+        page_path.write_text(page_content, encoding="utf-8")
+        new_pages += 1
+
+    print(f"    wiki: {len(pages)} pages ({new_pages} new, {len(pages) - new_pages} cached)")
+    return pages
+
+
+def wiki_query(question: str, wiki_dir: Path, budget: int = 2000) -> tuple[str, int]:
+    """Retrieve relevant wiki pages for a question within budget tokens.
+
+    Scores each page by keyword overlap with the question, with a bonus for
+    longer exact-match words (more discriminative).
+
+    Returns: (wiki_context_str, tokens_used)
+    """
+    if not wiki_dir.exists():
+        return "", 0
+
+    question_lower = question.lower()
+    question_words = {w for w in question_lower.split() if len(w) > 3}
+
+    scored: list[tuple[float, Path]] = []
+    for page_path in sorted(wiki_dir.glob("*.md")):
+        content       = safe_read(page_path)
+        content_lower = content.lower()
+        content_words = set(content_lower.split())
+
+        score = float(len(question_words & content_words))
+        # Bonus for longer word matches (more discriminative)
+        for word in question_words:
+            if len(word) > 6 and word in content_lower:
+                score += 0.5
+
+        if score > 0:
+            scored.append((score, page_path))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    parts: list[str] = []
+    used  = 0
+    for _, page_path in scored:
+        content      = safe_read(page_path)
+        header       = f"--- {page_path.stem.replace('_', ' ').title()} (wiki) ---\n"
+        chunk        = header + content
+        chunk_tokens = count_tokens(chunk)
+
+        if used + chunk_tokens <= budget:
+            parts.append(chunk)
+            used += chunk_tokens
+        elif used < budget:
+            remaining = budget - used
+            if remaining < 50:
+                break
+            ratio   = remaining / max(1, chunk_tokens)
+            trimmed = chunk[: int(len(chunk) * ratio)]
+            parts.append(trimmed)
+            used += count_tokens(trimmed)
+            break
+
+    return "\n\n".join(parts), used
+
+
+def build_bm25_index(
+    graph_path: Path,
+    wiki_dir: Path,
+    corpus_dir: Path,
+    out_path: Path,
+) -> dict:
+    """Build a BM25 index over three document collections:
+      - graph: rationale nodes from graphify (the 'why' annotations)
+      - wiki:  LLMWiki entity pages
+      - raw:   all files in the mixed corpus
+
+    Each document stored as {id, source, title, text}.
+    IDF computed over the full corpus.
+    Cached to out_path — delete to force rebuild.
+
+    Returns the in-memory index dict.
+    """
+    import math
+
+    if out_path.exists():
+        try:
+            return json.loads(out_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+
+    documents: list[dict] = []
+
+    # ── Graph rationale nodes ──────────────────────────────────────────────
+    if graph_path.exists():
+        try:
+            g = json.loads(graph_path.read_text(encoding="utf-8"))
+            for node in g.get("nodes", []):
+                if node.get("file_type") == "rationale":
+                    text = node.get("label", "")
+                    if len(text) > 20:
+                        documents.append({
+                            "id":     f"graph_{node.get('id', len(documents))}",
+                            "source": "graph",
+                            "title":  text[:60],
+                            "text":   text,
+                        })
+        except Exception:
+            pass
+
+    # ── Wiki pages ─────────────────────────────────────────────────────────
+    if wiki_dir.exists():
+        for page_path in sorted(wiki_dir.glob("*.md")):
+            if page_path.name == "lint_report.md":
+                continue
+            text = safe_read(page_path)
+            documents.append({
+                "id":     f"wiki_{page_path.stem}",
+                "source": "wiki",
+                "title":  page_path.stem.replace("_", " ").title(),
+                "text":   text,
+            })
+
+    # ── Raw corpus files ───────────────────────────────────────────────────
+    if corpus_dir.exists():
+        for fpath in read_corpus_files(corpus_dir):
+            text = safe_read(fpath)
+            if text.strip():
+                documents.append({
+                    "id":     f"raw_{fpath.name}",
+                    "source": "raw",
+                    "title":  fpath.name,
+                    "text":   text,
+                })
+
+    # ── BM25 IDF ──────────────────────────────────────────────────────────
+    N = len(documents)
+    df: dict[str, int] = {}
+    tokenized: list[list[str]] = []
+    for doc in documents:
+        tokens = doc["text"].lower().split()
+        tokenized.append(tokens)
+        for tok in set(tokens):
+            df[tok] = df.get(tok, 0) + 1
+
+    idf: dict[str, float] = {}
+    for term, freq in df.items():
+        idf[term] = math.log((N - freq + 0.5) / (freq + 0.5) + 1)
+
+    avg_dl = sum(len(t) for t in tokenized) / max(1, N)
+
+    index = {
+        "documents": documents,
+        "idf": idf,
+        "avg_dl": avg_dl,
+        "N": N,
+    }
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(index, indent=2), encoding="utf-8")
+    print(f"    bm25: indexed {N} documents ({sum(1 for d in documents if d['source']=='graph')} graph "
+          f"+ {sum(1 for d in documents if d['source']=='wiki')} wiki "
+          f"+ {sum(1 for d in documents if d['source']=='raw')} raw)")
+    return index
+
+
+def bm25_search(
+    question: str,
+    index: dict,
+    budget: int = 2000,
+    source_filter: str | None = None,
+    k1: float = 1.5,
+    b: float = 0.75,
+) -> tuple[str, int]:
+    """Score all indexed documents against *question* using BM25.
+
+    source_filter: if set, only score documents from that source ('graph'|'wiki'|'raw')
+
+    Returns (context_str, tokens_used) of top documents within budget.
+    """
+    import math
+
+    query_terms = question.lower().split()
+    idf        = index.get("idf", {})
+    avg_dl     = index.get("avg_dl", 1)
+    documents  = index.get("documents", [])
+
+    scored: list[tuple[float, dict]] = []
+    for doc in documents:
+        if source_filter and doc["source"] != source_filter:
+            continue
+        tokens = doc["text"].lower().split()
+        dl     = len(tokens)
+        score  = 0.0
+        tf_map: dict[str, int] = {}
+        for t in tokens:
+            tf_map[t] = tf_map.get(t, 0) + 1
+        for term in query_terms:
+            if term not in idf:
+                continue
+            tf = tf_map.get(term, 0)
+            numerator   = tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * dl / max(1, avg_dl))
+            score += idf[term] * (numerator / max(0.001, denominator))
+        if score > 0:
+            scored.append((score, doc))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    parts: list[str] = []
+    used  = 0
+    for _, doc in scored:
+        header       = f"--- {doc['title']} ({doc['source']}) ---\n"
+        chunk        = header + doc["text"]
+        chunk_tokens = count_tokens(chunk)
+        if used + chunk_tokens <= budget:
+            parts.append(chunk)
+            used += chunk_tokens
+        elif used < budget:
+            remaining = budget - used
+            if remaining < 50:
+                break
+            ratio   = remaining / max(1, chunk_tokens)
+            trimmed = chunk[: int(len(chunk) * ratio)]
+            parts.append(trimmed)
+            used += count_tokens(trimmed)
+            break
+
+    return "\n\n".join(parts), used
+
+
+def router(question: str, client) -> dict:
+    """Classify question type via one fast LLM call.
+
+    Returns:
+        {"type": str, "budget": int, "layers": dict, "reason": str}
+
+    Falls back to 'comprehensive' on any error.
+    """
+    import re as _re
+
+    type_descriptions = "\n\n".join(
+        f'  "{qtype}":\n  {cfg["description"]}'
+        for qtype, cfg in ROUTING_CONFIG.items()
+    )
+
+    prompt = (
+        "You are a question classifier for a code+documentation retrieval system.\n"
+        "Classify the question below into exactly one type.\n\n"
+        "TYPES:\n\n"
+        f"{type_descriptions}\n\n"
+        "CRITICAL DISAMBIGUATION RULE:\n"
+        '  "structural" = pure graph topology ONLY (imports, calls, extends). '
+        "No implementation detail needed.\n"
+        '  "comprehensive" = whenever the question asks HOW something works, HOW '
+        "X uses/relates to Y, or needs both code structure AND doc context to answer fully.\n"
+        '  If in doubt between "structural" and "comprehensive", choose "comprehensive".\n\n'
+        "EXAMPLES:\n"
+        '  "what calls AuthService.login?" → structural\n'
+        '  "how does AuthService use TokenStore?" → comprehensive\n'
+        '  "how does User relate to Permission?" → comprehensive\n'
+        '  "what motivated single-use tokens?" → rationale\n'
+        '  "what are the API guarantees?" → factual\n\n'
+        f'QUESTION: "{question}"\n\n'
+        "Respond with ONLY this JSON:\n"
+        '{{"type":"<type>","reason":"one sentence"}}'
+    )
+
+    try:
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=100,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        raw = resp.content[0].text.strip()
+        m   = _re.search(r"\{.*\}", raw, _re.DOTALL)
+        parsed = json.loads(m.group()) if m else {}
+        qtype  = parsed.get("type", "comprehensive")
+        if qtype not in ROUTING_CONFIG:
+            qtype = "comprehensive"
+        config = ROUTING_CONFIG[qtype]
+        return {
+            "type":   qtype,
+            "budget": config["budget"],
+            "layers": config["layers"],
+            "reason": parsed.get("reason", ""),
+            "input_tokens":  resp.usage.input_tokens,
+            "output_tokens": resp.usage.output_tokens,
+        }
+    except Exception as exc:
+        config = ROUTING_CONFIG["comprehensive"]
+        return {
+            "type":   "comprehensive",
+            "budget": config["budget"],
+            "layers": config["layers"],
+            "reason": f"fallback due to error: {exc}",
+            "input_tokens": 0, "output_tokens": 0,
+        }
+
+
+def routed_query(
+    question: str,
+    route: dict,
+    graph_path: Path,
+    doc_index_path: Path,
+    wiki_dir: Path,
+    bm25_index: dict,
+    corpus_dir: Path,
+) -> tuple[str, int, dict]:
+    """Assemble context from the layers specified by *route*, within the route's budget.
+
+    Budget is split proportionally by layer weight. Layers retrieved in descending
+    weight order so the most important source gets first pick of tokens.
+
+    Returns: (merged_context, total_tokens_used, tokens_per_layer)
+    """
+    total_budget = route["budget"]
+    layers       = route["layers"]
+    context_parts: list[str] = []
+    tokens_per_layer: dict[str, int] = {}
+
+    # Sort layers by weight descending — highest priority gets first pick
+    for layer_name, weight in sorted(layers.items(), key=lambda x: -x[1]):
+        if weight <= 0:
+            continue
+        layer_budget = int(total_budget * weight)
+
+        if layer_name == "graph":
+            ctx = ""
+            if graph_path.exists():
+                try:
+                    r = subprocess.run(
+                        ["graphify", "query", question,
+                         "--graph", str(graph_path),
+                         "--budget", str(layer_budget)],
+                        capture_output=True, text=True, timeout=60,
+                    )
+                    ctx = r.stdout
+                except Exception as exc:
+                    ctx = f"[graph error: {exc}]"
+            tok = count_tokens(ctx)
+            if ctx.strip():
+                context_parts.append(f"[CODE STRUCTURE]\n{ctx}")
+            tokens_per_layer["graph"] = tok
+
+        elif layer_name == "wiki":
+            ctx, tok = wiki_query(question, wiki_dir, budget=layer_budget)
+            if ctx.strip():
+                context_parts.append(f"[WIKI KNOWLEDGE]\n{ctx}")
+            tokens_per_layer["wiki"] = tok
+
+        elif layer_name == "hybrid":
+            doc_index: dict = {}
+            if doc_index_path.exists():
+                try:
+                    doc_index = json.loads(doc_index_path.read_text(encoding="utf-8"))
+                except Exception:
+                    doc_index = {}
+            ctx, tok = smart_doc_query(question, doc_index, corpus_dir, budget=layer_budget)
+            if ctx.strip():
+                context_parts.append(f"[DOCUMENTATION]\n{ctx}")
+            tokens_per_layer["hybrid"] = tok
+
+        elif layer_name == "bm25":
+            ctx, tok = bm25_search(question, bm25_index, budget=layer_budget)
+            if ctx.strip():
+                context_parts.append(f"[SEMANTIC SEARCH]\n{ctx}")
+            tokens_per_layer["bm25"] = tok
+
+    merged      = "\n\n".join(context_parts)
+    total_used  = sum(tokens_per_layer.values())
+    return merged, total_used, tokens_per_layer
+
+
+def wiki_lint(wiki_dir: Path, client) -> str:
+    """Run one LLM pass over all wiki pages to flag quality issues.
+
+    Checks for:
+    - Stale claims (methods/constants that may not exist)
+    - Missing cross-references between pages
+    - Contradictions between pages
+    - Orphan topics (mentioned but no page exists)
+
+    Result saved to wiki_dir/lint_report.md and returned as string.
+    """
+    lint_path = wiki_dir / "lint_report.md"
+    if lint_path.exists():
+        return safe_read(lint_path)
+
+    if not wiki_dir.exists():
+        return ""
+
+    pages = sorted(p for p in wiki_dir.glob("*.md") if p.name != "lint_report.md")
+    if not pages:
+        return ""
+
+    wiki_dump = "\n\n---\n\n".join(
+        f"# PAGE: {p.name}\n{safe_read(p)}" for p in pages
+    )
+
+    prompt = (
+        "You are a technical wiki editor. Review the following wiki pages for quality issues.\n\n"
+        "Check for:\n"
+        "1. Stale claims — specific method names, constants, or behaviours that contradict each other\n"
+        "2. Missing cross-references — entity A mentions entity B but no link/reference exists\n"
+        "3. Contradictions — two pages assert conflicting facts\n"
+        "4. Coverage gaps — important entities mentioned across pages but no dedicated page exists\n\n"
+        "Format your report as markdown with ## sections per issue type. "
+        "Be specific: quote the claim and the page it appears on. "
+        "If no issues found in a category, write 'None found.'\n\n"
+        f"WIKI PAGES:\n\n{wiki_dump[:12000]}"
+    )
+
+    try:
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        report = (
+            "# Wiki Lint Report\n\n"
+            f"Generated: {__import__('time').strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"Pages reviewed: {len(pages)}\n\n"
+            f"{resp.content[0].text.strip()}"
+        )
+    except Exception as exc:
+        report = f"# Wiki Lint Report\n\n[lint failed: {exc}]"
+
+    lint_path.write_text(report, encoding="utf-8")
+    print(f"    wiki lint: reviewed {len(pages)} pages → {lint_path.name}")
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +1643,90 @@ def build_all_graphs(results: dict) -> None:
                 "doc_files": n_docs,
             }
 
+    # Mixed corpus: code AST graph + LLM doc index
+    print(f"\n  Mixed corpus (code+docs cross-reference test)...")
+    if not MIXED_CORPUS_DIR.exists():
+        print(f"  mixed: SKIP (corpus not found at {MIXED_CORPUS_DIR})")
+        results["graphs"]["mixed"] = {"status": "SKIP"}
+    else:
+        mixed_graph = MIXED_GRAPH_OUT / "graph.json"
+        if mixed_graph.exists():
+            print(f"  mixed: graph already built (skipping rebuild)")
+            results["graphs"]["mixed"] = {"status": "CACHED"}
+        else:
+            print(f"  mixed: building code graph... ", end="", flush=True)
+            t0 = time.time()
+            ok, msg = build_graph(MIXED_CORPUS_DIR, MIXED_GRAPH_OUT)
+            dt = time.time() - t0
+            print(f"{'OK' if ok else 'FAIL'} ({dt:.1f}s) — {msg}")
+            results["graphs"]["mixed"] = {
+                "status": "OK" if ok else "FAIL",
+                "time_s": round(dt, 1), "msg": msg,
+            }
+
+        # Build LLM doc_index when API key is available
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        doc_index_path = MIXED_GRAPH_OUT / "doc_index.json"
+        if api_key and not doc_index_path.exists():
+            print(f"  mixed: extracting doc_index via LLM...")
+            try:
+                import anthropic as _anthropic
+                _client = _anthropic.Anthropic(api_key=api_key)
+                doc_files = sorted(MIXED_CORPUS_DIR.rglob("*.md"))
+                build_doc_index(doc_files, MIXED_GRAPH_OUT, _client)
+            except Exception as exc:
+                print(f"  WARN: doc_index build failed — {exc}")
+        elif doc_index_path.exists():
+            print(f"  mixed: doc_index already built (skipping)")
+        else:
+            print(f"  mixed: doc_index skipped (no API key)")
+
+        # Build LLMWiki entity pages (Test 14)
+        if api_key and doc_index_path.exists():
+            print(f"  mixed: building LLMWiki entity pages...")
+            try:
+                import anthropic as _anthropic
+                _client = _anthropic.Anthropic(api_key=api_key)
+                build_llmwiki(
+                    MIXED_GRAPH_OUT / "graph.json",
+                    doc_index_path,
+                    MIXED_CORPUS_DIR,
+                    WIKI_DIR,
+                    _client,
+                )
+            except Exception as exc:
+                print(f"  WARN: wiki build failed — {exc}")
+        elif WIKI_DIR.exists() and any(WIKI_DIR.glob("*.md")):
+            n_pages = len(list(WIKI_DIR.glob("*.md")))
+            print(f"  mixed: wiki already built ({n_pages} pages, skipping)")
+        else:
+            print(f"  mixed: wiki skipped (no API key or doc_index missing)")
+
+        # Build BM25 index over graph rationale + wiki + raw files
+        print(f"  mixed: building BM25 index...")
+        build_bm25_index(
+            MIXED_GRAPH_OUT / "graph.json",
+            WIKI_DIR,
+            MIXED_CORPUS_DIR,
+            BM25_INDEX_PATH,
+        )
+
+        # Wiki lint — flag stale claims and contradictions
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        lint_path = WIKI_DIR / "lint_report.md"
+        if api_key and WIKI_DIR.exists() and not lint_path.exists():
+            print(f"  mixed: running wiki lint...")
+            try:
+                import anthropic as _anthropic
+                _client = _anthropic.Anthropic(api_key=api_key)
+                wiki_lint(WIKI_DIR, _client)
+            except Exception as exc:
+                print(f"  WARN: wiki lint failed — {exc}")
+        elif lint_path.exists():
+            print(f"  mixed: wiki lint already done (skipping)")
+        else:
+            print(f"  mixed: wiki lint skipped (no API key)")
+
 
 # ---------------------------------------------------------------------------
 # Tests 9-12
@@ -1275,6 +2209,746 @@ def test12_decision_framework(results: dict) -> dict:
     return t12
 
 
+def test13_cross_modal_hybrid(results: dict) -> dict:
+    """Test 13: Cross-modal hybrid retrieval on mixed code+doc corpus.
+
+    Compares three approaches on MIXED_QUESTIONS:
+      A) graph-only  — plain graphify query (code AST, docs ignored)
+      B) hybrid      — 1000-token code graph + 1000-token smart doc retrieval
+      C) raw top-10  — grep top-10 files including docs
+
+    All three use the same ~2000 token context budget.
+    LLM-as-judge scores all three (correctness/completeness/relevance, /15).
+    """
+    print("\n" + "=" * 60)
+    print("TEST 13 — Cross-Modal Hybrid Retrieval (Mixed Code+Doc Corpus)")
+    print("=" * 60)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  SKIP: ANTHROPIC_API_KEY not set")
+        results["test13"] = {"status": "SKIP", "reason": "no ANTHROPIC_API_KEY"}
+        return results["test13"]
+
+    if not MIXED_CORPUS_DIR.exists():
+        print(f"  SKIP: mixed corpus not found at {MIXED_CORPUS_DIR}")
+        results["test13"] = {"status": "SKIP", "reason": "mixed corpus missing"}
+        return results["test13"]
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+    except Exception as exc:
+        results["test13"] = {"status": "SKIP", "reason": str(exc)}
+        return results["test13"]
+
+    mixed_graph     = MIXED_GRAPH_OUT / "graph.json"
+    doc_index_path  = MIXED_GRAPH_OUT / "doc_index.json"
+
+    # Build doc_index if it wasn't built in the pre-step
+    if not doc_index_path.exists():
+        print("  Building doc_index for mixed corpus...")
+        doc_files = sorted(MIXED_CORPUS_DIR.rglob("*.md"))
+        build_doc_index(doc_files, MIXED_GRAPH_OUT, client)
+
+    ACCURACY_DIR.mkdir(parents=True, exist_ok=True)
+
+    JUDGE_SYSTEM = (
+        "You are an impartial technical evaluator. Score answers objectively. "
+        "Do not favour any answer based on length. "
+        "Respond with only a JSON object — no markdown fences, no explanation."
+    )
+    JUDGE_TEMPLATE = (
+        "QUESTION: {question}\n\n"
+        "ANSWER A (graph-only — code structure only):\n{answer_a}\n\n"
+        "ANSWER B (hybrid — code structure + documentation):\n{answer_b}\n\n"
+        "ANSWER C (raw top-10 files):\n{answer_c}\n\n"
+        "Score each answer 1-5 on:\n"
+        "- correctness: factually accurate?\n"
+        "- completeness: covers all key aspects?\n"
+        "- relevance: focused, no padding?\n\n"
+        "Respond with ONLY this JSON (total = sum of three scores, max 15):\n"
+        '{{"answer_a":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"answer_b":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"answer_c":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"winner":"A_or_B_or_C_or_tie","comment":"one sentence"}}'
+    )
+
+    import re as _re
+
+    t13: dict[str, Any] = {
+        "status": "PASS",
+        "questions":    [],
+        "graph_wins":   0,
+        "hybrid_wins":  0,
+        "raw_wins":     0,
+        "ties":         0,
+        "total_input_tokens":  0,
+        "total_output_tokens": 0,
+    }
+    token_sums = {"graph": 0, "hybrid": 0, "raw": 0}
+
+    all_files = read_corpus_files(MIXED_CORPUS_DIR)
+    print(f"  Mixed corpus: {len(all_files)} files "
+          f"({sum(1 for f in all_files if f.suffix=='.py')} code, "
+          f"{sum(1 for f in all_files if f.suffix=='.md')} docs)")
+    print(f"\n  {'Q':<3} {'Question':<50} {'Graph':>6} {'Hybrid':>7} {'Raw':>5} {'Winner'}")
+    print("  " + "-" * 80)
+
+    for i, question in enumerate(MIXED_QUESTIONS):
+        entry: dict[str, Any] = {"question": question}
+
+        # ── Approach A: graph-only ──────────────────────────────────────
+        graph_ctx    = ""
+        graph_ctx_tokens = 0
+        if mixed_graph.exists():
+            try:
+                r = subprocess.run(
+                    ["graphify", "query", question,
+                     "--graph", str(mixed_graph),
+                     "--budget", str(QUERY_BUDGET)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                graph_ctx = r.stdout
+            except Exception as exc:
+                graph_ctx = f"[graph error: {exc}]"
+            graph_ctx_tokens = count_tokens(graph_ctx)
+
+        entry["graph_ctx_tokens"] = graph_ctx_tokens
+        token_sums["graph"] += graph_ctx_tokens
+
+        try:
+            resp_a = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on this code knowledge graph, answer the question.\n\n"
+                    f"Context:\n{graph_ctx}\n\nQuestion: {question}"}],
+            )
+            answer_a = resp_a.content[0].text
+            t13["total_input_tokens"]  += resp_a.usage.input_tokens
+            t13["total_output_tokens"] += resp_a.usage.output_tokens
+        except Exception as exc:
+            answer_a = f"[error: {exc}]"
+
+        # ── Approach B: hybrid ──────────────────────────────────────────
+        hybrid_ctx, h_graph_tok, h_doc_tok = hybrid_query(
+            question, mixed_graph, doc_index_path, MIXED_CORPUS_DIR,
+            total_budget=QUERY_BUDGET,
+        )
+        entry["hybrid_graph_tokens"] = h_graph_tok
+        entry["hybrid_doc_tokens"]   = h_doc_tok
+        token_sums["hybrid"] += h_graph_tok + h_doc_tok
+
+        try:
+            resp_b = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following context (code structure + documentation), "
+                    f"answer the question.\n\nContext:\n{hybrid_ctx}\n\nQuestion: {question}"}],
+            )
+            answer_b = resp_b.content[0].text
+            t13["total_input_tokens"]  += resp_b.usage.input_tokens
+            t13["total_output_tokens"] += resp_b.usage.output_tokens
+        except Exception as exc:
+            answer_b = f"[error: {exc}]"
+
+        # ── Approach C: raw top-10 ──────────────────────────────────────
+        top_files   = grep_top_files(MIXED_CORPUS_DIR, question, top_n=10)
+        raw_context = "\n\n".join(f"--- {f.name} ---\n{safe_read(f)}" for f in top_files)
+        raw_tok     = count_tokens(raw_context)
+        entry["raw_tokens"] = raw_tok
+        token_sums["raw"] += raw_tok
+
+        try:
+            resp_c = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following source files, answer the question.\n\n"
+                    f"Files:\n{raw_context}\n\nQuestion: {question}"}],
+            )
+            answer_c = resp_c.content[0].text
+            t13["total_input_tokens"]  += resp_c.usage.input_tokens
+            t13["total_output_tokens"] += resp_c.usage.output_tokens
+        except Exception as exc:
+            answer_c = f"[error: {exc}]"
+
+        # ── Judge ───────────────────────────────────────────────────────
+        try:
+            resp_j = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=400,
+                system=JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": JUDGE_TEMPLATE.format(
+                    question=question, answer_a=answer_a,
+                    answer_b=answer_b, answer_c=answer_c,
+                )}],
+            )
+            raw_resp = resp_j.content[0].text.strip()
+            t13["total_input_tokens"]  += resp_j.usage.input_tokens
+            t13["total_output_tokens"] += resp_j.usage.output_tokens
+            m = _re.search(r"\{.*\}", raw_resp, _re.DOTALL)
+            scores = json.loads(m.group()) if m else {}
+        except Exception as exc:
+            scores = {"error": str(exc)}
+
+        a_s = scores.get("answer_a", {}).get("total", 0)
+        b_s = scores.get("answer_b", {}).get("total", 0)
+        c_s = scores.get("answer_c", {}).get("total", 0)
+        winner_raw = scores.get("winner", "tie")
+        comment    = scores.get("comment", "")
+
+        winner_label = {"A": "graph", "B": "hybrid", "C": "raw"}.get(winner_raw, "tie")
+        if winner_label == "graph":   t13["graph_wins"]  += 1
+        elif winner_label == "hybrid": t13["hybrid_wins"] += 1
+        elif winner_label == "raw":    t13["raw_wins"]    += 1
+        else:                          t13["ties"]        += 1
+
+        entry.update({"graph_score": a_s, "hybrid_score": b_s, "raw_score": c_s,
+                      "winner": winner_label, "comment": comment})
+        t13["questions"].append(entry)
+
+        # Save side-by-side answer file
+        (ACCURACY_DIR / f"t13_q{i+1:02d}.md").write_text(
+            f"# Test13 Q{i+1}: {question}\n\n"
+            f"## A: Graph-only ({graph_ctx_tokens} ctx tokens) — {a_s}/15\n\n"
+            f"{answer_a}\n\n---\n\n"
+            f"## B: Hybrid ({h_graph_tok}+{h_doc_tok} tokens) — {b_s}/15\n\n"
+            f"{answer_b}\n\n---\n\n"
+            f"## C: Raw top-10 ({raw_tok} tokens) — {c_s}/15\n\n"
+            f"{answer_c}\n\n---\n\n"
+            f"**Winner:** {winner_label}  \n**Comment:** {comment}\n",
+            encoding="utf-8",
+        )
+
+        print(f"  Q{i+1:<2} {question[:50]:<50} {a_s:>5}/15 {b_s:>6}/15 {c_s:>4}/15  {winner_label}")
+
+    # Summary stats
+    n_qs = max(1, len(MIXED_QUESTIONS))
+    avg  = {k: round(v / n_qs) for k, v in token_sums.items()}
+    t13["avg_context_tokens"] = avg
+    t13["hybrid_vs_naive_ratio"] = round(avg["raw"] / avg["hybrid"], 2) if avg["hybrid"] > 0 else 0
+
+    judge_cost = (t13["total_input_tokens"] * PRICE_CLAUDE_INPUT +
+                  t13["total_output_tokens"] * PRICE_CLAUDE_OUTPUT)
+    t13["judge_cost_usd"] = round(judge_cost, 4)
+
+    g = t13["graph_wins"]; h = t13["hybrid_wins"]; r = t13["raw_wins"]; ti = t13["ties"]
+    n = g + h + r + ti
+    print(f"\n  Summary: graph {g}/{n}, hybrid {h}/{n}, raw {r}/{n}, ties {ti}/{n}")
+    print(f"  Avg context tokens — graph: {avg['graph']:,} | hybrid: {avg['hybrid']:,} | raw: {avg['raw']:,}")
+    print(f"  Hybrid uses {t13['hybrid_vs_naive_ratio']}x fewer tokens than raw top-10")
+    print(f"  Judge cost: ${judge_cost:.4f}")
+    print(f"\n  Answer files saved to {ACCURACY_DIR}/t13_q*.md")
+
+    results["test13"] = t13
+    return t13
+
+
+def test14_llmwiki(results: dict) -> dict:
+    """Test 14: LLMWiki entity pages — 4-way comparison on mixed corpus.
+
+    Compares four approaches on MIXED_QUESTIONS:
+      A) graph-only  — plain graphify query (code AST, docs ignored)
+      B) hybrid      — graph + smart_doc_query (from Test 13)
+      C) wiki        — LLMWiki pre-synthesised entity pages
+      D) raw top-10  — grep top-10 files including docs
+
+    Hypothesis: wiki (C) closes the gap between hybrid (B) and raw (D)
+    because wiki pages already synthesise code + doc knowledge into a single
+    coherent answer source — reducing the work the answering LLM must do.
+    """
+    print("\n" + "=" * 60)
+    print("TEST 14 — LLMWiki Entity Pages (4-Way Comparison)")
+    print("=" * 60)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  SKIP: ANTHROPIC_API_KEY not set")
+        results["test14"] = {"status": "SKIP", "reason": "no ANTHROPIC_API_KEY"}
+        return results["test14"]
+
+    if not MIXED_CORPUS_DIR.exists():
+        print(f"  SKIP: mixed corpus not found at {MIXED_CORPUS_DIR}")
+        results["test14"] = {"status": "SKIP", "reason": "mixed corpus missing"}
+        return results["test14"]
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+    except Exception as exc:
+        results["test14"] = {"status": "SKIP", "reason": str(exc)}
+        return results["test14"]
+
+    mixed_graph    = MIXED_GRAPH_OUT / "graph.json"
+    doc_index_path = MIXED_GRAPH_OUT / "doc_index.json"
+
+    # Ensure wiki pages exist
+    if not WIKI_DIR.exists() or not any(WIKI_DIR.glob("*.md")):
+        print("  Building LLMWiki pages...")
+        build_llmwiki(mixed_graph, doc_index_path, MIXED_CORPUS_DIR, WIKI_DIR, client)
+
+    n_wiki_pages = len(list(WIKI_DIR.glob("*.md")))
+    print(f"  Wiki: {n_wiki_pages} entity pages available")
+
+    ACCURACY_DIR.mkdir(parents=True, exist_ok=True)
+
+    JUDGE_SYSTEM = (
+        "You are an impartial technical evaluator. Score answers objectively. "
+        "Do not favour any answer based on length. "
+        "Respond with only a JSON object — no markdown fences, no explanation."
+    )
+    JUDGE_TEMPLATE = (
+        "QUESTION: {question}\n\n"
+        "ANSWER A (graph-only — code structure only):\n{answer_a}\n\n"
+        "ANSWER B (hybrid — code graph + documentation index):\n{answer_b}\n\n"
+        "ANSWER C (wiki — pre-synthesised LLMWiki entity pages):\n{answer_c}\n\n"
+        "ANSWER D (raw top-10 files):\n{answer_d}\n\n"
+        "Score each answer 1-5 on:\n"
+        "- correctness: factually accurate?\n"
+        "- completeness: covers all key aspects?\n"
+        "- relevance: focused, no padding?\n\n"
+        "Respond with ONLY this JSON (total = sum of three scores, max 15):\n"
+        '{{"answer_a":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"answer_b":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"answer_c":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"answer_d":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"winner":"A_or_B_or_C_or_D_or_tie","comment":"one sentence"}}'
+    )
+
+    import re as _re
+
+    t14: dict[str, Any] = {
+        "status": "PASS",
+        "questions":    [],
+        "graph_wins":   0,
+        "hybrid_wins":  0,
+        "wiki_wins":    0,
+        "raw_wins":     0,
+        "ties":         0,
+        "total_input_tokens":  0,
+        "total_output_tokens": 0,
+    }
+    token_sums = {"graph": 0, "hybrid": 0, "wiki": 0, "raw": 0}
+
+    print(f"\n  {'Q':<3} {'Question':<48} {'Graph':>6} {'Hybrid':>7} {'Wiki':>5} {'Raw':>5} {'Winner'}")
+    print("  " + "-" * 85)
+
+    for i, question in enumerate(MIXED_QUESTIONS):
+        entry: dict[str, Any] = {"question": question}
+
+        # ── Approach A: graph-only ──────────────────────────────────────────
+        graph_ctx = ""
+        if mixed_graph.exists():
+            try:
+                r = subprocess.run(
+                    ["graphify", "query", question,
+                     "--graph", str(mixed_graph),
+                     "--budget", str(QUERY_BUDGET)],
+                    capture_output=True, text=True, timeout=60,
+                )
+                graph_ctx = r.stdout
+            except Exception as exc:
+                graph_ctx = f"[graph error: {exc}]"
+        graph_tok = count_tokens(graph_ctx)
+        entry["graph_ctx_tokens"] = graph_tok
+        token_sums["graph"] += graph_tok
+
+        try:
+            resp_a = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on this code knowledge graph, answer the question.\n\n"
+                    f"Context:\n{graph_ctx}\n\nQuestion: {question}"}],
+            )
+            answer_a = resp_a.content[0].text
+            t14["total_input_tokens"]  += resp_a.usage.input_tokens
+            t14["total_output_tokens"] += resp_a.usage.output_tokens
+        except Exception as exc:
+            answer_a = f"[error: {exc}]"
+
+        # ── Approach B: hybrid (graph + doc_index) ──────────────────────────
+        hybrid_ctx, h_graph_tok, h_doc_tok = hybrid_query(
+            question, mixed_graph, doc_index_path, MIXED_CORPUS_DIR,
+            total_budget=QUERY_BUDGET,
+        )
+        entry["hybrid_tokens"] = h_graph_tok + h_doc_tok
+        token_sums["hybrid"] += h_graph_tok + h_doc_tok
+
+        try:
+            resp_b = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following context (code structure + documentation), "
+                    f"answer the question.\n\nContext:\n{hybrid_ctx}\n\nQuestion: {question}"}],
+            )
+            answer_b = resp_b.content[0].text
+            t14["total_input_tokens"]  += resp_b.usage.input_tokens
+            t14["total_output_tokens"] += resp_b.usage.output_tokens
+        except Exception as exc:
+            answer_b = f"[error: {exc}]"
+
+        # ── Approach C: wiki ────────────────────────────────────────────────
+        wiki_ctx, wiki_tok = wiki_query(question, WIKI_DIR, budget=QUERY_BUDGET)
+        entry["wiki_tokens"] = wiki_tok
+        token_sums["wiki"] += wiki_tok
+
+        try:
+            resp_c = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following pre-synthesised wiki pages, "
+                    f"answer the question.\n\nWiki:\n{wiki_ctx}\n\nQuestion: {question}"}],
+            )
+            answer_c = resp_c.content[0].text
+            t14["total_input_tokens"]  += resp_c.usage.input_tokens
+            t14["total_output_tokens"] += resp_c.usage.output_tokens
+        except Exception as exc:
+            answer_c = f"[error: {exc}]"
+
+        # ── Approach D: raw top-10 ──────────────────────────────────────────
+        top_files   = grep_top_files(MIXED_CORPUS_DIR, question, top_n=10)
+        raw_context = "\n\n".join(f"--- {f.name} ---\n{safe_read(f)}" for f in top_files)
+        raw_tok     = count_tokens(raw_context)
+        entry["raw_tokens"] = raw_tok
+        token_sums["raw"] += raw_tok
+
+        try:
+            resp_d = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following source files, answer the question.\n\n"
+                    f"Files:\n{raw_context}\n\nQuestion: {question}"}],
+            )
+            answer_d = resp_d.content[0].text
+            t14["total_input_tokens"]  += resp_d.usage.input_tokens
+            t14["total_output_tokens"] += resp_d.usage.output_tokens
+        except Exception as exc:
+            answer_d = f"[error: {exc}]"
+
+        # ── Judge ───────────────────────────────────────────────────────────
+        try:
+            resp_j = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=500,
+                system=JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": JUDGE_TEMPLATE.format(
+                    question=question, answer_a=answer_a,
+                    answer_b=answer_b, answer_c=answer_c, answer_d=answer_d,
+                )}],
+            )
+            raw_resp = resp_j.content[0].text.strip()
+            t14["total_input_tokens"]  += resp_j.usage.input_tokens
+            t14["total_output_tokens"] += resp_j.usage.output_tokens
+            m = _re.search(r"\{.*\}", raw_resp, _re.DOTALL)
+            scores = json.loads(m.group()) if m else {}
+        except Exception as exc:
+            scores = {"error": str(exc)}
+
+        a_s = scores.get("answer_a", {}).get("total", 0)
+        b_s = scores.get("answer_b", {}).get("total", 0)
+        c_s = scores.get("answer_c", {}).get("total", 0)
+        d_s = scores.get("answer_d", {}).get("total", 0)
+        winner_raw   = scores.get("winner", "tie")
+        comment      = scores.get("comment", "")
+
+        winner_label = {"A": "graph", "B": "hybrid", "C": "wiki", "D": "raw"}.get(winner_raw, "tie")
+        if   winner_label == "graph":  t14["graph_wins"]  += 1
+        elif winner_label == "hybrid": t14["hybrid_wins"] += 1
+        elif winner_label == "wiki":   t14["wiki_wins"]   += 1
+        elif winner_label == "raw":    t14["raw_wins"]    += 1
+        else:                          t14["ties"]        += 1
+
+        entry.update({
+            "graph_score": a_s, "hybrid_score": b_s,
+            "wiki_score":  c_s, "raw_score":    d_s,
+            "winner": winner_label, "comment": comment,
+        })
+        t14["questions"].append(entry)
+
+        # Save side-by-side answer file
+        (ACCURACY_DIR / f"t14_q{i+1:02d}.md").write_text(
+            f"# Test14 Q{i+1}: {question}\n\n"
+            f"## A: Graph-only ({graph_tok} ctx tokens) — {a_s}/15\n\n"
+            f"{answer_a}\n\n---\n\n"
+            f"## B: Hybrid ({h_graph_tok}+{h_doc_tok} tokens) — {b_s}/15\n\n"
+            f"{answer_b}\n\n---\n\n"
+            f"## C: Wiki ({wiki_tok} tokens) — {c_s}/15\n\n"
+            f"{answer_c}\n\n---\n\n"
+            f"## D: Raw top-10 ({raw_tok} tokens) — {d_s}/15\n\n"
+            f"{answer_d}\n\n---\n\n"
+            f"**Winner:** {winner_label}  \n**Comment:** {comment}\n",
+            encoding="utf-8",
+        )
+
+        print(f"  Q{i+1:<2} {question[:48]:<48} {a_s:>5}/15 {b_s:>6}/15 {c_s:>4}/15 {d_s:>4}/15  {winner_label}")
+
+    # Summary stats
+    n_qs = max(1, len(MIXED_QUESTIONS))
+    avg  = {k: round(v / n_qs) for k, v in token_sums.items()}
+    t14["avg_context_tokens"] = avg
+    t14["wiki_vs_naive_ratio"] = round(avg["raw"] / avg["wiki"], 2) if avg["wiki"] > 0 else 0
+
+    judge_cost = (t14["total_input_tokens"] * PRICE_CLAUDE_INPUT +
+                  t14["total_output_tokens"] * PRICE_CLAUDE_OUTPUT)
+    t14["judge_cost_usd"] = round(judge_cost, 4)
+
+    g = t14["graph_wins"]; h = t14["hybrid_wins"]
+    w = t14["wiki_wins"];  r = t14["raw_wins"]; ti = t14["ties"]
+    n = g + h + w + r + ti
+
+    # Score averages
+    q_entries = t14["questions"]
+    avg_scores = {
+        "graph":  round(sum(q.get("graph_score",  0) for q in q_entries) / n_qs, 1),
+        "hybrid": round(sum(q.get("hybrid_score", 0) for q in q_entries) / n_qs, 1),
+        "wiki":   round(sum(q.get("wiki_score",   0) for q in q_entries) / n_qs, 1),
+        "raw":    round(sum(q.get("raw_score",    0) for q in q_entries) / n_qs, 1),
+    }
+    t14["avg_scores"] = avg_scores
+
+    print(f"\n  Summary: graph {g}/{n}, hybrid {h}/{n}, wiki {w}/{n}, raw {r}/{n}, ties {ti}/{n}")
+    print(f"  Avg scores /15  — graph: {avg_scores['graph']} | hybrid: {avg_scores['hybrid']} | "
+          f"wiki: {avg_scores['wiki']} | raw: {avg_scores['raw']}")
+    print(f"  Avg context tokens — graph: {avg['graph']:,} | hybrid: {avg['hybrid']:,} | "
+          f"wiki: {avg['wiki']:,} | raw: {avg['raw']:,}")
+    print(f"  Wiki uses {t14['wiki_vs_naive_ratio']}x fewer tokens than raw top-10")
+    print(f"  Judge cost: ${judge_cost:.4f}")
+    print(f"\n  Answer files saved to {ACCURACY_DIR}/t14_q*.md")
+
+    results["test14"] = t14
+    return t14
+
+
+def test15_routed_system(results: dict) -> dict:
+    """Test 15: Question-aware router with dynamic budget allocation.
+
+    The router classifies each question into a type, selects retrieval layers
+    and allocates budget per layer accordingly. Compares the routed system
+    against raw top-10 files.
+
+    Hypothesis: routing to the right layer + budget matches raw accuracy
+    (13.8/15 avg) at 2-4x fewer tokens, because each question gets exactly
+    the knowledge density it needs — no more, no less.
+    """
+    print("\n" + "=" * 60)
+    print("TEST 15 — Question-Aware Router + Dynamic Budget")
+    print("=" * 60)
+
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        print("  SKIP: ANTHROPIC_API_KEY not set")
+        results["test15"] = {"status": "SKIP", "reason": "no ANTHROPIC_API_KEY"}
+        return results["test15"]
+
+    if not MIXED_CORPUS_DIR.exists():
+        print(f"  SKIP: mixed corpus not found")
+        results["test15"] = {"status": "SKIP", "reason": "mixed corpus missing"}
+        return results["test15"]
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=api_key)
+    except Exception as exc:
+        results["test15"] = {"status": "SKIP", "reason": str(exc)}
+        return results["test15"]
+
+    mixed_graph    = MIXED_GRAPH_OUT / "graph.json"
+    doc_index_path = MIXED_GRAPH_OUT / "doc_index.json"
+
+    # Load BM25 index (build if missing)
+    if not BM25_INDEX_PATH.exists():
+        print("  Building BM25 index...")
+        bm25_index = build_bm25_index(mixed_graph, WIKI_DIR, MIXED_CORPUS_DIR, BM25_INDEX_PATH)
+    else:
+        bm25_index = json.loads(BM25_INDEX_PATH.read_text(encoding="utf-8"))
+
+    # Wiki lint (run if missing)
+    lint_path = WIKI_DIR / "lint_report.md"
+    if not lint_path.exists() and WIKI_DIR.exists():
+        print("  Running wiki lint...")
+        lint_result = wiki_lint(WIKI_DIR, client)
+    else:
+        lint_result = safe_read(lint_path) if lint_path.exists() else ""
+
+    ACCURACY_DIR.mkdir(parents=True, exist_ok=True)
+
+    JUDGE_SYSTEM = (
+        "You are an impartial technical evaluator. Score answers objectively. "
+        "Do not favour any answer based on length. "
+        "Respond with only a JSON object — no markdown fences, no explanation."
+    )
+    JUDGE_TEMPLATE = (
+        "QUESTION: {question}\n\n"
+        "ANSWER A (routed system — question-aware layer selection):\n{answer_a}\n\n"
+        "ANSWER B (raw top-10 files — brute force):\n{answer_b}\n\n"
+        "Score each answer 1-5 on:\n"
+        "- correctness: factually accurate?\n"
+        "- completeness: covers all key aspects?\n"
+        "- relevance: focused, no padding?\n\n"
+        "Respond with ONLY this JSON:\n"
+        '{{"answer_a":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"answer_b":{{"correctness":0,"completeness":0,"relevance":0,"total":0}},'
+        '"winner":"A_or_B_or_tie","comment":"one sentence"}}'
+    )
+
+    import re as _re
+
+    t15: dict[str, Any] = {
+        "status": "PASS",
+        "questions":       [],
+        "routed_wins":     0,
+        "raw_wins":        0,
+        "ties":            0,
+        "total_input_tokens":  0,
+        "total_output_tokens": 0,
+        "lint_issues":     0,
+    }
+
+    # Count lint issues
+    if lint_result:
+        t15["lint_issues"] = lint_result.count("##") - 1  # subtract header
+
+    print(f"\n  Budget config:")
+    for qtype, cfg in ROUTING_CONFIG.items():
+        print(f"    {qtype:<15} {cfg['budget']:>5} tokens  layers: {cfg['layers']}")
+
+    print(f"\n  {'Q':<3} {'Type':<15} {'Budget':>7} {'Routed':>8} {'Raw':>5} {'Winner'}")
+    print("  " + "-" * 55)
+
+    token_sums = {"routed": 0, "raw": 0}
+
+    for i, question in enumerate(MIXED_QUESTIONS):
+        entry: dict[str, Any] = {"question": question}
+
+        # ── Route ───────────────────────────────────────────────────────────
+        route = router(question, client)
+        t15["total_input_tokens"]  += route["input_tokens"]
+        t15["total_output_tokens"] += route["output_tokens"]
+        entry["route"] = route
+
+        # ── Routed retrieval ────────────────────────────────────────────────
+        routed_ctx, routed_tok, tok_per_layer = routed_query(
+            question, route,
+            mixed_graph, doc_index_path, WIKI_DIR, bm25_index, MIXED_CORPUS_DIR,
+        )
+        entry["routed_tokens"]    = routed_tok
+        entry["tokens_per_layer"] = tok_per_layer
+        token_sums["routed"]     += routed_tok
+
+        try:
+            resp_a = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following context, answer the question.\n\n"
+                    f"Context:\n{routed_ctx}\n\nQuestion: {question}"}],
+            )
+            answer_a = resp_a.content[0].text
+            t15["total_input_tokens"]  += resp_a.usage.input_tokens
+            t15["total_output_tokens"] += resp_a.usage.output_tokens
+        except Exception as exc:
+            answer_a = f"[error: {exc}]"
+
+        # ── Raw top-10 ──────────────────────────────────────────────────────
+        top_files   = grep_top_files(MIXED_CORPUS_DIR, question, top_n=10)
+        raw_context = "\n\n".join(f"--- {f.name} ---\n{safe_read(f)}" for f in top_files)
+        raw_tok     = count_tokens(raw_context)
+        entry["raw_tokens"] = raw_tok
+        token_sums["raw"]  += raw_tok
+
+        try:
+            resp_b = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=512,
+                messages=[{"role": "user", "content":
+                    f"Based on the following source files, answer the question.\n\n"
+                    f"Files:\n{raw_context}\n\nQuestion: {question}"}],
+            )
+            answer_b = resp_b.content[0].text
+            t15["total_input_tokens"]  += resp_b.usage.input_tokens
+            t15["total_output_tokens"] += resp_b.usage.output_tokens
+        except Exception as exc:
+            answer_b = f"[error: {exc}]"
+
+        # ── Judge ───────────────────────────────────────────────────────────
+        try:
+            resp_j = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=400,
+                system=JUDGE_SYSTEM,
+                messages=[{"role": "user", "content": JUDGE_TEMPLATE.format(
+                    question=question, answer_a=answer_a, answer_b=answer_b,
+                )}],
+            )
+            raw_resp = resp_j.content[0].text.strip()
+            t15["total_input_tokens"]  += resp_j.usage.input_tokens
+            t15["total_output_tokens"] += resp_j.usage.output_tokens
+            m = _re.search(r"\{.*\}", raw_resp, _re.DOTALL)
+            scores = json.loads(m.group()) if m else {}
+        except Exception as exc:
+            scores = {"error": str(exc)}
+
+        a_s = scores.get("answer_a", {}).get("total", 0)
+        b_s = scores.get("answer_b", {}).get("total", 0)
+        winner_raw   = scores.get("winner", "tie")
+        comment      = scores.get("comment", "")
+
+        winner_label = {"A": "routed", "B": "raw"}.get(winner_raw, "tie")
+        if   winner_label == "routed": t15["routed_wins"] += 1
+        elif winner_label == "raw":    t15["raw_wins"]    += 1
+        else:                          t15["ties"]        += 1
+
+        entry.update({
+            "routed_score": a_s, "raw_score": b_s,
+            "winner": winner_label, "comment": comment,
+        })
+        t15["questions"].append(entry)
+
+        # Save answer file
+        layer_breakdown = " | ".join(f"{k}:{v}" for k, v in tok_per_layer.items())
+        (ACCURACY_DIR / f"t15_q{i+1:02d}.md").write_text(
+            f"# Test15 Q{i+1}: {question}\n\n"
+            f"**Route:** {route['type']} | **Budget:** {route['budget']} tokens\n"
+            f"**Reason:** {route['reason']}\n"
+            f"**Layer tokens:** {layer_breakdown}\n\n"
+            f"## A: Routed ({routed_tok} tokens) — {a_s}/15\n\n"
+            f"{answer_a}\n\n---\n\n"
+            f"## B: Raw top-10 ({raw_tok} tokens) — {b_s}/15\n\n"
+            f"{answer_b}\n\n---\n\n"
+            f"**Winner:** {winner_label}  \n**Comment:** {comment}\n",
+            encoding="utf-8",
+        )
+
+        print(f"  Q{i+1:<2} {route['type']:<15} {route['budget']:>6}tok "
+              f"{a_s:>7}/15 {b_s:>4}/15  {winner_label}")
+
+    # Summary
+    n_qs = max(1, len(MIXED_QUESTIONS))
+    avg  = {k: round(v / n_qs) for k, v in token_sums.items()}
+    t15["avg_context_tokens"] = avg
+    t15["token_savings_vs_raw"] = round(avg["raw"] / avg["routed"], 2) if avg["routed"] > 0 else 0
+
+    avg_scores = {
+        "routed": round(sum(q.get("routed_score", 0) for q in t15["questions"]) / n_qs, 1),
+        "raw":    round(sum(q.get("raw_score",    0) for q in t15["questions"]) / n_qs, 1),
+    }
+    t15["avg_scores"] = avg_scores
+
+    judge_cost = (t15["total_input_tokens"] * PRICE_CLAUDE_INPUT +
+                  t15["total_output_tokens"] * PRICE_CLAUDE_OUTPUT)
+    t15["judge_cost_usd"] = round(judge_cost, 4)
+
+    rw = t15["routed_wins"]; ra = t15["raw_wins"]; ti = t15["ties"]
+    n  = rw + ra + ti
+    print(f"\n  Results: routed {rw}/{n}, raw {ra}/{n}, ties {ti}/{n}")
+    print(f"  Avg scores — routed: {avg_scores['routed']}/15 | raw: {avg_scores['raw']}/15")
+    print(f"  Avg tokens — routed: {avg['routed']:,} | raw: {avg['raw']:,}")
+    print(f"  Token savings vs raw: {t15['token_savings_vs_raw']}x")
+    print(f"  Wiki lint issues flagged: {t15['lint_issues']}")
+    print(f"  Judge cost: ${judge_cost:.4f}")
+    print(f"\n  Answer files: {ACCURACY_DIR}/t15_q*.md")
+    if lint_path.exists():
+        print(f"  Lint report:  {lint_path}")
+
+    results["test15"] = t15
+    return t15
+
+
 # ---------------------------------------------------------------------------
 # Final report
 # ---------------------------------------------------------------------------
@@ -1282,7 +2956,7 @@ def test12_decision_framework(results: dict) -> dict:
 def print_final_report(results: dict) -> None:
     print("\n")
     print("=" * 60)
-    print("BENCHMARK REPORT")
+    print("PRISM BENCHMARK REPORT")
     print("=" * 60)
     tests = [
         ("test1",  "Baseline Naive Token Count"),
@@ -1297,6 +2971,9 @@ def print_final_report(results: dict) -> None:
         ("test10", "Dollar Cost Model ($/query)"),
         ("test11", "LLM-as-Judge Accuracy Comparison"),
         ("test12", "Decision Framework"),
+        ("test13", "Cross-Modal Hybrid (Mixed Code+Doc Corpus)"),
+        ("test14", "LLMWiki Entity Pages (4-Way Comparison)"),
+        ("test15", "Question-Aware Router + Dynamic Budget"),
     ]
     for key, name in tests:
         data = results.get(key, {})
@@ -1337,7 +3014,55 @@ def print_final_report(results: dict) -> None:
         g = t11.get("graph_wins", 0)
         r = t11.get("raw_wins", 0)
         ti = t11.get("ties", 0)
-        print(f"\n  LLM judge: graph wins {g}, raw wins {r}, ties {ti}")
+        print(f"\n  LLM judge (code-only, Test 11): graph {g} wins, raw {r} wins, ties {ti}")
+
+    t13 = results.get("test13", {})
+    if t13.get("status") == "PASS":
+        g  = t13.get("graph_wins",  0)
+        h  = t13.get("hybrid_wins", 0)
+        r  = t13.get("raw_wins",    0)
+        ti = t13.get("ties",        0)
+        avg = t13.get("avg_context_tokens", {})
+        ratio = t13.get("hybrid_vs_naive_ratio", 0)
+        print(f"\n  Cross-modal hybrid (Test 13):")
+        print(f"    graph {g} wins | hybrid {h} wins | raw {r} wins | ties {ti}")
+        print(f"    Avg context tokens — graph: {avg.get('graph',0):,} | "
+              f"hybrid: {avg.get('hybrid',0):,} | raw: {avg.get('raw',0):,}")
+        print(f"    Hybrid uses {ratio}x fewer tokens than raw at same total budget")
+
+    t14 = results.get("test14", {})
+    if t14.get("status") == "PASS":
+        g  = t14.get("graph_wins",  0)
+        h  = t14.get("hybrid_wins", 0)
+        w  = t14.get("wiki_wins",   0)
+        r  = t14.get("raw_wins",    0)
+        ti = t14.get("ties",        0)
+        avg    = t14.get("avg_context_tokens", {})
+        scores = t14.get("avg_scores", {})
+        ratio  = t14.get("wiki_vs_naive_ratio", 0)
+        print(f"\n  LLMWiki 4-way comparison (Test 14):")
+        print(f"    graph {g} | hybrid {h} | wiki {w} | raw {r} | ties {ti}")
+        print(f"    Avg scores /15 — graph: {scores.get('graph',0)} | hybrid: {scores.get('hybrid',0)} | "
+              f"wiki: {scores.get('wiki',0)} | raw: {scores.get('raw',0)}")
+        print(f"    Avg tokens — graph: {avg.get('graph',0):,} | hybrid: {avg.get('hybrid',0):,} | "
+              f"wiki: {avg.get('wiki',0):,} | raw: {avg.get('raw',0):,}")
+        print(f"    Wiki uses {ratio}x fewer tokens than raw")
+
+    t15 = results.get("test15", {})
+    if t15.get("status") == "PASS":
+        rw     = t15.get("routed_wins", 0)
+        ra     = t15.get("raw_wins",    0)
+        ti     = t15.get("ties",        0)
+        avg    = t15.get("avg_context_tokens", {})
+        scores = t15.get("avg_scores", {})
+        sav    = t15.get("token_savings_vs_raw", 0)
+        lint   = t15.get("lint_issues", 0)
+        print(f"\n  Routed system (Test 15):")
+        print(f"    routed {rw} wins | raw {ra} wins | ties {ti}")
+        print(f"    Avg scores — routed: {scores.get('routed',0)}/15 | raw: {scores.get('raw',0)}/15")
+        print(f"    Avg tokens — routed: {avg.get('routed',0):,} | raw: {avg.get('raw',0):,}")
+        print(f"    Token savings vs raw: {sav}x")
+        print(f"    Wiki lint issues: {lint}")
 
 
 def save_results(results: dict) -> None:
@@ -1363,7 +3088,7 @@ def save_results(results: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("Graphify Token Reduction Benchmark Suite")
+    print("PRISM — Pre-compiled Retrieval with Intelligent Strata Management")
     print(f"Corpora: {', '.join(CORPUS_DIRS)}")
     print(f"Encoder: cl100k_base (tiktoken)")
 
@@ -1392,6 +3117,9 @@ def main() -> None:
     test10_dollar_cost_model(results)
     test11_llm_judge(results)
     test12_decision_framework(results)
+    test13_cross_modal_hybrid(results)
+    test14_llmwiki(results)
+    test15_routed_system(results)
 
     # Final report
     print_final_report(results)

@@ -1,6 +1,8 @@
 # PRISM — Exploring Multi-Layer Retrieval for Mixed Code + Documentation Corpora
 
 > **One sentence:** Graphify builds the map. PRISM decides which map to use.
+>
+> PRISM doesn't replace retrieval systems — it orchestrates them.
 
 > **What this is:** A research exploration into whether routing questions across multiple pre-compiled knowledge representations — code structure graph, document index, synthesised wiki pages, and keyword search — can match the accuracy of raw file retrieval at significantly lower token cost. This is a benchmark artifact and thinking piece, not a production system.
 
@@ -138,14 +140,25 @@ This is a research exploration. Before treating these results as production evid
 
 ---
 
-## What Would Make This Stronger
+## Roadmap
 
-- Expand to 50–100 questions with human-verified ground truth
-- Add strong baselines: embedding retrieval + reranker, repo-map + long context
-- Test on real open-source repositories at 1,000+ file scale
-- Replace LLM-as-judge with task-specific correctness metrics
-- Stress-test the router on out-of-distribution question types
-- Ship a usable CLI: `prism run <repo_path>`
+This repo is the foundation for a forthcoming paper on multi-layer retrieval strategies for mixed code+documentation corpora. The benchmark establishes the hypothesis and early evidence. The paper will address the current gaps rigorously.
+
+**Toward publication:**
+- [ ] Expand evaluation to 50–100 questions with human-verified ground truth
+- [ ] Add strong baselines: embedding retrieval + reranker, repo-map + long-context agent
+- [ ] Test on real open-source repositories at 1,000+ file scale
+- [ ] Replace LLM-as-judge with task-specific correctness metrics (exact match, citation grounding)
+- [ ] Stress-test the router on out-of-distribution question types and multi-language repos
+
+**Toward a usable package (`pip install prism-retrieval`):**
+- [ ] Refactor `benchmark.py` into a proper Python package (`prism/layers/`, `prism/router.py`, `prism/cli.py`)
+- [ ] Clean public API: `PRISM(repo_path).build()` → `PRISM.query("question")`
+- [ ] Config via `prism.yaml` — define entities and corpus without touching Python
+- [ ] CLI: `prism build <repo>` · `prism query "question"` · `prism status`
+- [ ] Publish to PyPI as `prism-retrieval`
+
+Contributions and feedback welcome — especially on evaluation design and baseline selection.
 
 ---
 

@@ -1,15 +1,18 @@
 """
-Graphify Token Reduction Benchmark Suite
-=========================================
-Empirically verifies whether the graphify framework actually reduces token
-consumption as claimed (~71.5x fewer tokens per query vs naive file reading).
+PRISM Benchmark Suite
+=====================
+Pre-compiled Retrieval with Intelligent Strata Management
+
+Empirically validates whether layered, pre-compiled retrieval (code graph +
+doc index + LLMWiki + BM25 + question-aware router) reduces token consumption
+and maintains accuracy vs naive file reading.
 
 Run:
     python benchmark.py
 
 Requires:
-    pip install graphifyy tiktoken anthropic
-    ANTHROPIC_API_KEY env var for Tests 5 & 6
+    pip install graphifyy tiktoken anthropic python-dotenv
+    ANTHROPIC_API_KEY env var (or .env file) for LLM-powered tests
 """
 from __future__ import annotations
 
@@ -1623,7 +1626,7 @@ def test8_code_vs_doc_extraction_cost(results: dict) -> dict:
 
 def build_all_graphs(results: dict) -> None:
     print("\n" + "=" * 60)
-    print("PRE-STEP — Building Graphify Graphs")
+    print("PRE-STEP — Building PRISM Knowledge Layers")
     print("=" * 60)
     results["graphs"] = {}
     for name in CORPUS_DIRS:
@@ -2094,7 +2097,7 @@ def test11_llm_judge(results: dict) -> dict:
 
 
 def test12_decision_framework(results: dict) -> dict:
-    """Test 12: Data-driven recommendation — use graphify if/don't if."""
+    """Test 12: Data-driven recommendation — when to use PRISM vs alternatives."""
     print("\n" + "=" * 60)
     print("TEST 12 — Decision Framework")
     print("=" * 60)
@@ -2145,12 +2148,12 @@ def test12_decision_framework(results: dict) -> dict:
 
     # Print recommendation
     print(f"""
-  GRAPHIFY DECISION FRAMEWORK
-  ============================
+  PRISM DECISION FRAMEWORK
+  =========================
   Based on measured benchmark data:
 
-  USE GRAPHIFY WHEN:
-  ------------------
+  USE PRISM WHEN:
+  ---------------
   [OK] Corpus is CODE-HEAVY (>80% .py/.ts/.go/.rs/etc files)
        Reason:  tree-sitter AST extraction is deterministic, fast, and FREE.
                 Docs need an LLM call per file — code costs $0 to build.
@@ -2165,20 +2168,20 @@ def test12_decision_framework(results: dict) -> dict:
        Evidence: small={small_ratio}x vs large={large_ratio}x
 
   [OK] You need ARCHITECTURAL / RELATIONSHIP queries
-       ("how does X connect to Y?", "what calls Z?", "show me the flow from A to B")
-       Reason:  The graph captures CALL, IMPORTS, CONTAINS edges invisible in raw text.
+       ("how does X connect to Y?", "what calls Z?", "how does X use Y?")
+       Reason:  Code graph captures CALL, IMPORTS, CONTAINS edges invisible in raw text.
+                LLMWiki pre-synthesises cross-modal knowledge for rationale questions.
        Accuracy: {accuracy_note}
 
   [OK] Cost matters ({f'{large_cost_ratio}x cheaper than naive on large corpus' if large_cost_ratio else 'see test10'})
-       Reason:  Graphify query tokens are capped at --budget; naive scales with corpus.
+       Reason:  PRISM context is bounded by dynamic budget; naive scales with corpus.
 
-  DON'T USE GRAPHIFY WHEN:
-  ------------------------
-  [WARN] Corpus is DOC-HEAVY (.md/.txt/.rst/.pdf dominate)
-         Reason:  collect_files() excludes doc extensions. AST extract() has NO .md handler.
+  DON'T USE PRISM WHEN:
+  ---------------------
+  [WARN] Corpus is DOC-HEAVY (.md/.txt/.rst/.pdf dominate) with no code
+         Reason:  Code graph AST excludes doc extensions. Layer 1 has 0% coverage on pure docs.
          Finding: {doc_nodes} nodes extracted from {doc_files_n} doc files = {doc_coverage}% coverage.
-         Fix:     Run the full /graphify skill (Claude subagents per doc file) OR use embeddings.
-         Alt:     text-embedding-3-small at $0.02/1M tokens + vector search + read top-5 files.
+         Alt:     text-embedding-3-small ($0.02/1M tokens) + vector search + read top-5 files.
 
   [WARN] You need IMPLEMENTATION DETAIL answers
          ("exactly what does line 47 do?", "what is the default value of X?")
@@ -2191,19 +2194,19 @@ def test12_decision_framework(results: dict) -> dict:
          :,} tokens total.
 
   [WARN] One-off or infrequent queries
-         Reason:  Build cost is real. Only worth it if you reuse the graph many times.
+         Reason:  Build cost is real. Only worth it if you reuse the layers many times.
 
   SUMMARY TABLE:
   --------------
   Scenario                               Verdict
   -------------------------------------- ----------------------------------------
-  >50 code files, >20 queries            USE graphify
-  Mixed code+doc, code questions         USE graphify (docs ignored, code works)
+  >50 code files, >20 queries            USE PRISM
+  Mixed code+doc, cross-ref questions    USE PRISM (all layers contribute)
   <10 code files, <5 queries             SKIP — just read the files
-  Doc-heavy corpus, doc questions        SKIP graphify AST; use embeddings or /graphify skill
+  Doc-only corpus, doc questions         SKIP code graph; use embeddings
   Need exact implementation details      SKIP — raw files beat the graph here
-  Exploring a new large codebase         USE graphify — graph shows architecture fast
-  Writing a chatbot over documentation   SKIP — needs embeddings + full skill pipeline
+  Exploring a new large codebase         USE PRISM — graph shows architecture fast
+  Writing a chatbot over documentation   SKIP — needs embeddings pipeline
 """)
 
     t12: dict[str, Any] = {
@@ -3120,7 +3123,7 @@ def save_results(results: dict) -> None:
     print(f"\n  Raw data saved to {data_path}")
 
     # Markdown report
-    md_lines = ["# Graphify Token Reduction Benchmark Report\n"]
+    md_lines = ["# PRISM Benchmark Report\n"]
     md_lines.append(f"Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
     for key, val in results.items():
         md_lines.append(f"\n## {key}\n\n```json\n{json.dumps(val, indent=2, default=str)}\n```\n")

@@ -221,9 +221,23 @@ prism-benchmark/
 | Embedding + vector search | Works on any text | Misses code structure; no pre-synthesis |
 | **Graphify** | Rich code knowledge graph, AST-based, widely adopted | Single representation; no cross-modal doc routing |
 | RAG + reranking | Strong text retrieval | Retrieves at query time; no cross-modal fusion |
-| LLMWiki *(Karpathy)* | Pre-synthesised compact knowledge | Single-layer; no routing or budget management |
+| [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) *(Karpathy)* | Pre-synthesised compact knowledge | Single-layer; no routing or budget management |
 | **PRISM** | Routes across all of the above per question type | Small eval set; router not yet generalised; early stage |
 
 ---
 
-*Built on [Graphify](https://github.com/safishamsi/graphify) · [tiktoken](https://github.com/openai/tiktoken) · [Anthropic Claude](https://anthropic.com) · pure-Python BM25 · [reportlab](https://www.reportlab.com)*
+---
+
+## Credits & Attributions
+
+| What | Credit |
+|---|---|
+| **Code graph (Layer 1)** | [Graphify](https://github.com/safishamsi/graphify) by Safi Shamsi — AST parsing via tree-sitter |
+| **LLM Wiki concept (Layer 3)** | [Andrej Karpathy](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) — pre-synthesised entity pages from raw sources |
+| **BM25 algorithm (Layer 4)** | Robertson & Zaragoza (2009), *The Probabilistic Relevance Framework: BM25 and Beyond* — standard Okapi BM25, k1=1.5, b=0.75 |
+| **Doc corpus** | Public READMEs from [nanoGPT](https://github.com/karpathy/nanoGPT) (Karpathy, MIT), [Transformers](https://github.com/huggingface/transformers), [Whisper](https://github.com/openai/whisper), [vLLM](https://github.com/vllm-project/vllm), [LlamaIndex](https://github.com/run-llama/llama_index), and others — fetched from their public repositories under their respective licences |
+| **Token counting** | [tiktoken](https://github.com/openai/tiktoken) by OpenAI |
+| **LLM inference & judging** | [Anthropic Claude](https://anthropic.com) (claude-sonnet-4-6) |
+| **PDF generation** | [reportlab](https://www.reportlab.com) |
+
+The mixed code+doc corpus (`benchmark-corpus/mixed/`) is original synthetic code written for this benchmark and is not derived from any external project.

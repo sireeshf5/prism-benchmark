@@ -70,6 +70,11 @@ BENCHMARK_QUESTIONS = [
 DOC_CORPUS_DIR  = Path("benchmark-corpus/docs")
 DOC_GRAPH_OUT   = Path("graphify-out/docs")
 
+# Doc corpus: publicly available README files used as the documentation corpus
+# for Tests 9, 10, and the docs baseline. Includes nanoGPT and other open-source
+# ML projects by Andrej Karpathy, Hugging Face, OpenAI, Microsoft, and others.
+# All fetched from their public GitHub repositories under their respective licences.
+# nanoGPT: https://github.com/karpathy/nanoGPT (MIT licence, Andrej Karpathy)
 DOC_FETCH_URLS: list[tuple[str, str]] = [
     ("nanogpt_readme",      "https://raw.githubusercontent.com/karpathy/nanoGPT/master/README.md"),
     ("transformers_readme", "https://raw.githubusercontent.com/huggingface/transformers/main/README.md"),
@@ -571,6 +576,13 @@ def hybrid_query(
 
 
 def build_llmwiki(
+    # Inspired by Andrej Karpathy's "LLM Wiki" concept:
+    # https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f
+    # Karpathy's original idea: pre-build one markdown page per concept/entity,
+    # synthesised from raw sources, so an LLM can query compact pre-integrated
+    # knowledge rather than raw documents at query time.
+    # This implementation adapts the concept to mixed code+doc corpora by
+    # fusing AST graph nodes with doc_index extractions per entity page.
     graph_path: Path,
     doc_index_path: Path,
     corpus_dir: Path,
@@ -755,6 +767,12 @@ def build_bm25_index(
     Cached to out_path — delete to force rebuild.
 
     Returns the in-memory index dict.
+
+    BM25 (Okapi BM25) algorithm:
+      Robertson, S. & Zaragoza, H. (2009). The Probabilistic Relevance Framework:
+      BM25 and Beyond. Foundations and Trends in Information Retrieval, 3(4), 333-389.
+      https://doi.org/10.1561/1500000019
+      Parameters used: k1=1.5, b=0.75 (standard defaults).
     """
     import math
 

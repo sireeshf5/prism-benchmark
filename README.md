@@ -1,25 +1,18 @@
-# PRISM — Pre-compiled Retrieval with Intelligent Strata Management
+# PRISM — Multi-Layer Retrieval for Mixed Code + Documentation Corpora
 
-> **Plain English:** Imagine asking a question about a large software project with thousands of files and documents. PRISM reads all of it once, organises the knowledge into four specialist layers, then — for each question — picks only the right layers and sends a fraction of the content to the AI. The result: answers just as good as reading everything, at a fraction of the cost.
-
-PRISM is a benchmarked retrieval architecture for enterprise codebases that combines a code structure graph, document index, pre-synthesised knowledge pages, and keyword search — all routed intelligently per question type.
-
-**Measured results:** 2.67× fewer tokens than raw retrieval · 37.8× fewer tokens than reading all files · 12.8/15 accuracy vs 14.4/15 for raw (closing 90% of the gap at a fraction of the cost).
+> **What this is:** An exploration of whether routing questions across multiple pre-compiled knowledge representations — code structure graph, document index, synthesised wiki pages, and keyword search — can match the accuracy of raw file retrieval at significantly lower token cost. This is a research benchmark, not a production system.
 
 ---
 
-## The Problem
+## The Core Idea
 
-When an AI needs to answer questions over a large codebase with mixed code and documentation, the naive approach is expensive and inaccurate:
+Most retrieval approaches treat a codebase as flat text. PRISM tests a different hypothesis:
 
-| Approach | Tokens per query (145-file repo) | Accuracy |
-|---|---|---|
-| Read all files | 65,854 | High — but $0.20/query at scale |
-| grep top-5 files | 13,290 | Medium — misses cross-file relationships |
-| Code graph only | 1,740 | Medium — blind to documentation |
-| **PRISM routed** | **~3,295** | **High — 12.8/15 vs 14.4/15 for raw** |
+> **Different questions need different representations of the same repository.**
 
-The core challenge: **code and documentation live in different worlds.** Code graphs capture call relationships but ignore markdown. Embedding search retrieves docs but misses code architecture. Neither alone is sufficient for an enterprise codebase where the answer to "why was this designed this way?" lives in a design doc, not the code.
+A question like *"what calls `AuthService.login()`?"* is best answered by a code structure graph. A question like *"why was single-use token design chosen?"* is best answered by a pre-synthesised design rationale page. Sending all files to the AI for both wastes tokens and introduces noise.
+
+PRISM builds four views of a repository once, caches them, then routes each question to the right view — or combination of views — with a dynamic token budget.
 
 ---
 
@@ -29,85 +22,128 @@ The core challenge: **code and documentation live in different worlds.** Code gr
 
 ---
 
-## How It Works
+## The Four Layers
 
-PRISM builds **four knowledge layers once** — then reuses them across every query:
-
-| Layer | What it is | Built how | Cost |
+| Layer | What it captures | Built how | Cost |
 |---|---|---|---|
-| **1. Code Graph** | Map of every function, class, and how they call each other | Tree-sitter AST parser (no AI needed) | $0 |
-| **2. Doc Index** | Per-document summary: key facts, what code it references, its type | One AI call per document, cached | ~$0.002/doc |
-| **3. LLMWiki** | Pre-written "encyclopedia pages" per major concept, blending code structure with doc content | One AI call per concept page, cached | ~$0.004/page |
-| **4. BM25** | Keyword search index across all three layers above | Pure maths, no AI | $0 |
+| **1. Code Graph** | Every function, class, call edge, and import relationship | Tree-sitter AST parser — no AI needed | $0 |
+| **2. Doc Index** | Per-document summary, key facts, and code cross-references | One AI call per document, cached by SHA-256 | ~$0.002/doc |
+| **3. LLMWiki** | Pre-synthesised "entity pages" integrating code structure with doc content | One AI call per concept page, cached | ~$0.004/page |
+| **4. BM25** | Keyword search index across all three layers | Pure term-frequency maths — no AI | $0 |
 
-When a question arrives, a **router** (one AI call) classifies it and assigns the right layers and token budget:
+When a question arrives, a **router** (one AI call) classifies the intent and assigns layers and a token budget:
 
-| Question type | Budget | Which layers | Example |
+| Question type | Budget | Layer split | Example |
 |---|---|---|---|
-| structural | 1,500 tok | Code graph only | "What calls `AuthService.login()`?" |
+| structural | 1,500 tok | Graph only | "What calls `AuthService.login()`?" |
 | rationale | 2,000 tok | Wiki 80% + graph 20% | "Why was single-use token design chosen?" |
 | factual | 2,500 tok | Wiki 60% + doc index 40% | "What does the refresh endpoint guarantee?" |
 | similarity | 3,000 tok | BM25 60% + wiki 20% + graph 20% | "Find code similar to the token expiry logic" |
 | comprehensive | 5,000 tok | Wiki 40% + graph 30% + BM25 30% | "How does `AuthService` use `TokenStore`?" |
 
-If any layer has nothing useful to contribute (returns < 30% of its allocated budget), the unused tokens carry forward to the next layer automatically — **adaptive budget spill**.
+If a layer has nothing useful to contribute — returning less than 30% of its allocated budget — unused tokens carry forward to the next layer (**adaptive budget spill**).
 
 ---
 
-## Benchmark Results
+## What the Benchmark Measured
 
-### Hypothesis 1 — Token reduction grows with corpus size ✅
+Three hypotheses tested across corpora of 6, 47, and 145 Python files plus a mixed code+documentation corpus of 15 files:
 
-| Corpus | Files | Naive tokens | PRISM tokens | Reduction |
+### H1 — Token reduction grows with corpus size
+
+| Corpus | Files | Naive tokens | Code graph tokens | Reduction |
 |---|---|---|---|---|
-| Small | 6 | 3,138 | 336 | **9.3×** |
-| Medium | 47 | 21,189 | 1,310 | **16.2×** |
+| Small | 6 | 3,138 | 336 | 9.3× |
+| Medium | 47 | 21,189 | 1,310 | 16.2× |
 | Large | 145 | 65,854 | 1,740 | **37.8×** |
 
-The larger the codebase, the more PRISM saves. Ratio grows monotonically with corpus size.
+Confirmed. Compression ratio grows monotonically. The graph output is bounded by `--budget`; naive scales linearly with corpus size.
 
-### Hypothesis 2 — Adding layers improves accuracy without ballooning tokens ✅
+### H2 — Each additional layer adds accuracy without proportional token cost
 
-Tested on a mixed code + documentation corpus (10 Python files + 5 design docs), scored by an AI judge out of 15:
+Tested on a 15-file mixed corpus (10 Python files + 5 design docs), scored by Claude as judge out of 15, across 5 questions:
 
-| Approach | Avg score | Avg tokens | vs raw |
+| Approach | Avg score /15 | Avg tokens | Gap to raw |
 |---|---|---|---|
-| Code graph alone | 10.4 / 15 | 1,697 | — |
-| + Doc index (hybrid) | 12.6 / 15 | 1,873 | +21% accuracy, +10% tokens |
-| + LLMWiki | 13.6 / 15 | 2,006 | +31% accuracy, +18% tokens |
-| **PRISM routed** | **12.8 / 15** | **3,295** | **+23% accuracy, 2.67× fewer tokens than raw** |
-| Raw top-10 files | 14.4 / 15 | 8,804 | baseline |
+| Code graph alone | 10.4 | 1,697 | −4.0 pts |
+| + Doc index | 12.6 | 1,873 | −1.8 pts |
+| + LLMWiki | 13.6 | 2,006 | −0.8 pts |
+| **PRISM routed** | **12.8** | **3,295** | **−1.6 pts** |
+| Raw top-10 files | 14.4 | 8,804 | baseline |
 
-### Hypothesis 3 — Documentation blindspot resolved ✅
+Confirmed directionally. Each layer closes the gap. PRISM reaches within 1.6 points of raw at 2.67× fewer tokens.
 
-A code structure graph alone extracts **0 nodes from 15 markdown files** — it simply cannot read documentation. PRISM's Doc Index and LLMWiki layers solve this by design, with LLMWiki scoring 15/15 on two documentation-heavy questions.
+### H3 — Code graph alone cannot answer documentation questions
 
-### Break-even: when does PRISM pay for itself?
+A code structure graph extracted **0 nodes from 15 markdown files** — tree-sitter has no documentation handler. Every doc query returned an empty result. The Doc Index and LLMWiki layers resolve this by bypassing the AST entirely.
 
-| Corpus | One-time build cost | Saving per query | Break-even |
-|---|---|---|---|
-| Small (6 files) | 7,800 tokens | 2,802 tokens | **3 queries** |
-| Medium (47 files) | 189,800 tokens | 19,879 tokens | **10 queries** |
-| Large (145 files) | 171,600 tokens | 64,114 tokens | **3 queries** |
-
-After break-even, every query is pure savings. The cache ensures that changing 5 files in a 47-file corpus only rebuilds those 5 entries — **89.4% cache hit rate**.
+Confirmed. Doc blindspot is real and the layered fix works.
 
 ---
 
-## When to Use PRISM
+## Honest Limitations
 
-**Use PRISM when:**
-- Your codebase has **more than 50 files** or **more than 20,000 tokens**
-- You will ask **more than ~10 questions** against the same codebase
-- Your project mixes **code and documentation** (the primary use case)
-- Questions are **architectural** — "how does X use Y?", "what calls Z?"
-- **Cost matters** — PRISM is 15.9× cheaper per query than reading all files on large corpora
+This is a research exploration. Before treating these results as production evidence, these limitations matter:
 
-**Skip PRISM when:**
-- Fewer than 10 files — just read them directly
-- You need **exact line-level details** — raw files win here (graph nodes are labels, not full code)
-- The corpus is **documentation only with no code** — use vector embeddings instead
-- You have a **one-off question** — the build cost won't pay off
+**1. The evaluation set is very small.**
+Accuracy results are based on 5 questions per corpus, scored by an AI judge. Five questions is a demo, not a statistically meaningful sample. Scores also shift between runs (observed variance of ±1–2 points on the same questions). Claims about accuracy should be treated as directional, not precise.
+
+**2. Baselines are not state-of-the-art.**
+The comparisons are against naive full reads, grep top-5, and code graph only. There is no comparison against a proper embedding retriever + reranker, hybrid sparse+dense retrieval, or repo-map approaches (like those used in Aider). The token efficiency claims hold against naive baselines — not necessarily against the best modern alternatives.
+
+**3. The router is hand-tuned, not generalised.**
+The routing system works for the 5 question types defined here. A disambiguation rule had to be manually added mid-experiment to correctly route "how does X use Y?" questions. A router that needs hand-authored rules per question pattern will not generalise cleanly to unseen domains without additional tuning.
+
+**4. The corpus sizes do not represent enterprise scale.**
+The largest corpus is 145 files and ~66,000 tokens. A real enterprise repository has thousands of files, multiple languages, generated code, stale documentation, and conflicting specs. Results at 145 files do not directly predict behaviour at 10,000 files.
+
+**5. LLM-as-judge is the accuracy measurement.**
+There is no human evaluation, no ground-truth answer set, and no task-specific correctness check. The judge model is the same model used for retrieval in several layers, which introduces potential bias. Accuracy figures are indicative, not rigorous.
+
+**6. Cost figures are point-in-time.**
+Dollar costs are calculated against April 2026 Claude pricing. Model pricing changes frequently. The token efficiency ratios are durable; the dollar figures are not.
+
+**7. Adaptive spill did not fire in testing.**
+The budget reallocation mechanism (carrying unused tokens forward when a layer underperforms) is implemented correctly but returned 0 spill events on the current corpus — every layer was productive for every question tested. The mechanism works as a safety net but is unproven in practice.
+
+---
+
+## What This Is Good For
+
+Despite the limitations, the repo demonstrates something real:
+
+- **The multi-representation idea is directionally correct.** Different question types benefit from different views of a repository. This is underexplored in most retrieval systems.
+- **Pre-compilation is a viable strategy.** Building layers once and routing queries across them is meaningfully cheaper than retrieving at query time for repeated use cases.
+- **Layered indexing compounds.** Each layer added measurably improved accuracy in testing. The progression from graph-only (10.4) → hybrid (12.6) → wiki (13.6) is consistent and interpretable.
+- **Cost-awareness matters.** Most retrieval benchmarks measure accuracy only. This benchmark explicitly models token cost, build amortisation, and break-even — which is relevant for production decisions.
+
+---
+
+## What Would Make This Stronger
+
+If this were to evolve from exploration to evidence:
+
+- Expand to 50+ questions per corpus with human-verified ground truth
+- Add strong baselines: embedding retrieval + reranker, repo-map + long context
+- Test on real open-source repositories at 1,000+ file scale
+- Replace LLM-as-judge with task-specific correctness metrics (exact match, citation grounding)
+- Stress-test the router on out-of-distribution question types
+- Measure latency, not just token count
+
+---
+
+## Running It
+
+```bash
+pip install graphifyy tiktoken anthropic python-dotenv reportlab
+
+echo "ANTHROPIC_API_KEY=sk-..." > .env
+
+python benchmark.py          # runs all 15 tests, builds layers on first run
+python generate_pdf_report.py  # generates benchmark-results/prism-benchmark-report.pdf
+```
+
+All four layers are built on the first run and cached by SHA-256. Subsequent runs reuse the cache — 89.4% hit rate observed when 5 of 47 files changed.
 
 ---
 
@@ -117,78 +153,36 @@ After break-even, every query is pure savings. The cache ensures that changing 5
 prism-benchmark/
 ├── benchmark.py              # 15-test benchmark suite
 ├── generate_pdf_report.py    # PDF report generator
-├── architecture.svg          # Architecture diagram (this repo)
+├── architecture.svg          # Architecture diagram
 ├── benchmark-corpus/
 │   ├── small/                # 6 Python files (~3k tokens)
 │   ├── medium/               # 47 files (~21k tokens)
 │   ├── large/                # 145 files (~66k tokens)
 │   ├── docs/                 # 15 markdown READMEs (doc-only corpus)
-│   └── mixed/                # 10 code + 5 docs — the primary test corpus
-├── graphify-out/
-│   └── mixed/
-│       ├── graph.json        # Layer 1: code AST graph
-│       ├── doc_index.json    # Layer 2: per-doc extractions
-│       ├── bm25_index.json   # Layer 4: keyword index
-│       └── wiki/             # Layer 3: 7 LLMWiki entity pages
+│   └── mixed/                # 10 code + 5 design docs — primary test corpus
+├── graphify-out/mixed/
+│   ├── graph.json            # Layer 1: code AST graph
+│   ├── doc_index.json        # Layer 2: per-doc LLM extractions
+│   ├── bm25_index.json       # Layer 4: keyword index
+│   └── wiki/                 # Layer 3: 7 entity pages
 └── benchmark-results/
     ├── data.json             # Raw results (all 15 tests)
     ├── prism-benchmark-report.pdf
-    └── accuracy/             # Per-question AI judge answers
+    └── accuracy/             # Per-question answer files
 ```
 
 ---
 
-## Running the Benchmark
+## Relation to Prior Work
 
-```bash
-# Install dependencies
-pip install graphifyy tiktoken anthropic python-dotenv reportlab
-
-# Add your API key
-echo "ANTHROPIC_API_KEY=sk-..." > .env
-
-# Run all 15 tests (builds all 4 layers on first run, cached after)
-python benchmark.py
-
-# Generate the PDF report
-python generate_pdf_report.py
-```
-
-The first run builds all four layers. Every subsequent run reads from cache — completing the full 15-test suite in seconds for non-LLM tests.
-
----
-
-## The 15 Tests
-
-The benchmark suite proves three hypotheses in sequence:
-
-**Token efficiency (Tests 1–4, 6–7, 10)**
-Establishes how much smaller PRISM's context window is vs naive approaches, across corpus sizes, against realistic grep baselines, and translated into dollars.
-
-**Accuracy (Tests 5, 11)**
-Verifies that smaller context doesn't mean worse answers on code-only questions.
-
-**Doc blindspot (Tests 8–9)**
-Proves the code graph alone cannot answer documentation questions — and quantifies the gap.
-
-**Layered improvement (Tests 13–15)**
-Shows each layer adding measurable accuracy: hybrid → wiki → full PRISM router.
-
-**Infrastructure (Tests 7, 12)**
-Cache hit rate and the decision framework for when to use PRISM vs alternatives.
-
----
-
-## How PRISM Relates to Prior Approaches
-
-| Approach | What it does well | Where it falls short |
+| Approach | Strength | Gap this repo explores |
 |---|---|---|
-| **Raw file reading** | Perfect recall | Scales poorly — cost grows with every file added |
-| **grep / embedding search** | Fast retrieval | Misses code structure; no cross-modal reasoning |
-| **Code graph (graphify)** | Captures architecture, calls, imports | Cannot read documentation |
-| **RAG + embeddings** | Works on text of any kind | Misses code relationships; retrieves at query time |
-| **LLMWiki** *(Karpathy)* | Pre-synthesised, compact knowledge | Single-layer; no routing |
-| **PRISM** | Combines all four in one routed system | Build cost requires reuse to amortise |
+| Raw file reading | Perfect recall | Cost scales linearly — impractical at corpus size |
+| Embedding + vector search | Works on any text | Misses code structure; no pre-synthesis |
+| Code graph (graphify / tree-sitter) | Captures architecture and call edges | Cannot read documentation |
+| RAG + reranking | Strong text retrieval | Retrieves at query time; no cross-modal fusion |
+| LLMWiki *(Karpathy)* | Pre-synthesised compact knowledge | Code-focused; no routing or budget management |
+| **PRISM** | Combines all four with question-aware routing | Small eval set; router not yet generalised |
 
 ---
 

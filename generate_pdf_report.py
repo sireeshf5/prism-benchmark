@@ -79,6 +79,14 @@ def HR():
 def SP(n=4):
     return Spacer(1, n)
 
+def trunc(text: str, max_chars: int) -> str:
+    """Truncate at a word boundary, never mid-word."""
+    if len(text) <= max_chars:
+        return text
+    cut = text[:max_chars]
+    last_space = cut.rfind(" ")
+    return (cut[:last_space] if last_space > 0 else cut) + "…"
+
 def badge_text(status):
     return {"PASS": "PASS", "WARN": "WARN", "FAIL": "FAIL", "SKIP": "SKIP"}.get(status, status)
 
@@ -98,7 +106,7 @@ def section_header(title, status=None):
             textColor=badge_color(status), alignment=TA_RIGHT
         ))
         tdata = [[cells[0], badge]]
-        t = Table(tdata, colWidths=[W - 2*MARGIN - 30, 30])
+        t = Table(tdata, colWidths=[CW - 35, 35])
         t.setStyle(TableStyle([
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
             ("BOTTOMPADDING", (0,0), (-1,-1), 4),
@@ -111,7 +119,7 @@ def alert_box(text, kind="blue"):
     bg     = {"green": GREEN_BG, "red": RED_BG, "amber": AMBER_BG, "blue": BLUE_BG}[kind]
     style  = ParagraphStyle("alert", fontName="Helvetica", fontSize=9,
                             textColor=colour, leading=13)
-    t = Table([[Paragraph(text, style)]], colWidths=[W - 2*MARGIN])
+    t = Table([[Paragraph(text, style)]], colWidths=[CW])
     t.setStyle(TableStyle([
         ("BACKGROUND",   (0,0), (-1,-1), bg),
         ("BOX",          (0,0), (-1,-1), 0.5, colour),
@@ -128,7 +136,7 @@ def data_table(headers, rows, col_widths=None):
                                          textColor=GRAY, leading=11)) for h in headers]
     tdata = [hrow] + rows
     if col_widths is None:
-        col_widths = [(W - 2*MARGIN) / len(headers)] * len(headers)
+        col_widths = [(CW) / len(headers)] * len(headers)
     t = Table(tdata, colWidths=col_widths)
     ts = TableStyle([
         ("BACKGROUND",    (0,0), (-1,0),  LGRAY),
@@ -152,7 +160,7 @@ def score_box(label, score, tokens, colour, bg):
         [Paragraph(f"<b>{score}/15</b>", ParagraphStyle("sv", fontName="Helvetica-Bold",
                    fontSize=20, textColor=colour, leading=24))],
         [Paragraph(f"{tokens:,} input tokens", sSmall)],
-    ], colWidths=[(W - 2*MARGIN)/2 - 8])
+    ], colWidths=[(CW)/2 - 8])
     inner.setStyle(TableStyle([
         ("BACKGROUND",   (0,0),(-1,-1), bg),
         ("BOX",          (0,0),(-1,-1), 0.5, colour),
@@ -172,30 +180,30 @@ import time as _time
 _now = _time.strftime("%Y-%m-%d")
 
 # ── Cover / Header ──────────────────────────────────────────────────────────
-cover = Table([[
-    Paragraph("PRISM", sTitle),
-    SP(2),
-    Paragraph(
-        "Pre-compiled Retrieval with Intelligent Strata Management",
-        sSubtitle),
-    SP(2),
-    Paragraph(
+CW = W - 2*MARGIN  # usable content width
+cover = Table([
+    [Paragraph("PRISM", sTitle)],
+    [Spacer(1, 6)],
+    [Paragraph("Pre-compiled Retrieval with Intelligent Strata Management", sSubtitle)],
+    [Spacer(1, 4)],
+    [Paragraph(
         "A layered knowledge retrieval system for enterprise codebases — "
         "code graph · doc index · LLMWiki · BM25 · question-aware router",
-        sSubtitle),
-    SP(4),
-    Paragraph(
+        sSubtitle)],
+    [Spacer(1, 8)],
+    [Paragraph(
         f"Generated: {_now}  |  Model: claude-sonnet-4-6  |  "
-        "Dynamic budget: 1,500–5,000 tokens/query  |  Encoder: cl100k_base",
-        sMeta),
-]], colWidths=[W - 2*MARGIN])
+        "Dynamic budget: 1,500–5,000 tok/query  |  Encoder: cl100k_base",
+        sMeta)],
+], colWidths=[CW - 40])
 cover.setStyle(TableStyle([
     ("BACKGROUND",   (0,0),(-1,-1), DARK),
     ("LEFTPADDING",  (0,0),(-1,-1), 20),
     ("RIGHTPADDING", (0,0),(-1,-1), 20),
-    ("TOPPADDING",   (0,0),(-1,-1), 22),
-    ("BOTTOMPADDING",(0,0),(-1,-1), 22),
-    ("ROUNDEDCORNERS", (0,0),(-1,-1), [6,6,6,6]),
+    ("TOPPADDING",   (0,0),( 0, 0), 22),
+    ("TOPPADDING",   (0,1),(-1,-1), 0),
+    ("BOTTOMPADDING",(0,0),(-1,-2), 0),
+    ("BOTTOMPADDING",(0,-1),(-1,-1), 22),
 ]))
 story.append(cover)
 story.append(SP(12))
@@ -246,7 +254,7 @@ for label, val, sub, col in metrics:
         Paragraph(sub, sSmall),
     ])
 
-mt = Table(metric_rows, colWidths=[80, 60, (W - 2*MARGIN - 145)])
+mt = Table(metric_rows, colWidths=[120, 65, CW - 120 - 65])
 mt.setStyle(TableStyle([
     ("GRID",          (0,0),(-1,-1), 0.5, MGRAY),
     ("BACKGROUND",    (0,0),(-1,-1), LGRAY),
@@ -263,7 +271,7 @@ left_metrics = metric_rows[:3]
 right_metrics = metric_rows[3:]
 
 def mini_metric_table(rows):
-    t = Table(rows, colWidths=[75, 55, None])
+    t = Table(rows, colWidths=[120, 65, CW - 120 - 65])
     t.setStyle(TableStyle([
         ("GRID",          (0,0),(-1,-1), 0.5, MGRAY),
         ("BACKGROUND",    (0,0),(-1,-1), LGRAY),
@@ -323,7 +331,7 @@ for title, desc, detail, output, col, bg in arch_layers:
         [Paragraph(detail, sSmall)],
         [Paragraph(f"Output: {output}", sItalic)],
     ]
-    bt = Table(block_rows, colWidths=[W - 2*MARGIN])
+    bt = Table(block_rows, colWidths=[CW])
     bt.setStyle(TableStyle([
         ("BACKGROUND",    (0,0),(-1,-1), bg),
         ("BOX",           (0,0),(-1,-1), 0.5, col),
@@ -357,13 +365,13 @@ routing_rows = [
 story.append(data_table(
     ["Type", "Budget (tok)", "Layer Split", "Example questions"],
     routing_rows,
-    col_widths=[75, 60, 130, W-2*MARGIN-270]
+    col_widths=[75, 60, 130, CW-270]
 ))
 story.append(SP(10))
 
 # ── Token Reduction ──────────────────────────────────────────────────────────
 story.append(section_header("Tests 1–3 — Token Reduction vs Naive Full Read", "PASS"))
-cw = [(W-2*MARGIN)/7]*7
+cw = [(CW)/7]*7
 rows = [
     [Paragraph("Small",  sBold), Paragraph("6",       sNum), Paragraph("3,138",  sNum),
      Paragraph("336",    sNum), Paragraph("9.3x",  sNumB), Paragraph("$0.0171", sNum), Paragraph("$0.0087", sNumG)],
@@ -384,7 +392,7 @@ story.append(SP(10))
 
 # ── Realistic baseline ───────────────────────────────────────────────────────
 story.append(section_header("Test 4 — Realistic Baseline: Code Graph Layer vs Grep-Top-5-Files", "PASS"))
-cw4 = [50, (W-2*MARGIN)*0.45, 70, 70, 50]
+cw4 = [50, (CW)*0.45, 70, 70, 50]
 rows4 = [
     [Paragraph("Small", sBold),  Paragraph("main training loop?", sBody),         Paragraph("806",    sNum), Paragraph("336",   sNum), Paragraph("2.4x", sNumG)],
     [Paragraph("",      sBody),  Paragraph("attention mechanism?", sBody),         Paragraph("585",    sNum), Paragraph("646",   sNum), Paragraph("0.9x", sNumR)],
@@ -405,7 +413,7 @@ story.append(SP(10))
 
 # ── Cost model ───────────────────────────────────────────────────────────────
 story.append(section_header("Tests 6 & 10 — Build Cost, Break-Even & $/query", "PASS"))
-cw6 = [(W-2*MARGIN)/4]*4
+cw6 = [(CW)/4]*4
 rows6 = [
     [Paragraph("Small",  sBold), Paragraph("7,800",   sNum), Paragraph("2,802",  sNum), Paragraph("2.8 queries", sNumB)],
     [Paragraph("Medium", sBold), Paragraph("88,400",  sNum), Paragraph("19,902", sNum), Paragraph("4.4 queries", sNumB)],
@@ -414,7 +422,7 @@ rows6 = [
 story.append(data_table(["Corpus", "Build cost (tokens)", "Savings/query", "Break-even"], rows6, col_widths=cw6))
 story.append(SP(6))
 
-cw10 = [55, 90, 75, 65, None]
+cw10 = [50, 95, 72, 62, CW-50-95-72-62]
 rows10 = [
     [Paragraph("Small", sBold),  Paragraph("Naive (all files)", sBody),    Paragraph("3,138",  sNum), Paragraph("$0.0171", sNum), Paragraph("",      sSmall)],
     [Paragraph("",      sBody),  Paragraph("Code graph query",  sBody),    Paragraph("336",    sNum), Paragraph("$0.0087", sNumG),Paragraph("2.0x cheaper", sGreen)],
@@ -468,10 +476,10 @@ for i, q in enumerate(questions):
         score_box("CODE GRAPH", gs, g_tok, BLUE, BLUE_BG),
         score_box("RAW FILES", rs, r_tok, GREEN, GREEN_BG),
     ]
-    pair = Table([row_content], colWidths=[(W-2*MARGIN)/2 - 4, (W-2*MARGIN)/2 - 4])
+    pair = Table([row_content], colWidths=[(CW)/2 - 4, (CW)/2 - 4])
     pair.setStyle(TableStyle([("LEFTPADDING",(0,0),(-1,-1),0),("RIGHTPADDING",(0,0),(-1,-1),0),
                                ("TOPPADDING",(0,0),(-1,-1),0),("BOTTOMPADDING",(0,0),(-1,-1),0),
-                               ("COLWIDTH",(0,0),(0,0),(W-2*MARGIN)/2-4)]))
+                               ("COLWIDTH",(0,0),(0,0),(CW)/2-4)]))
 
     block = KeepTogether([
         Paragraph(f"<b>Q{i+1}: {q['question']}</b>", sH2),
@@ -491,7 +499,7 @@ story.append(alert_box(
     "The AST extractor has no handler for documentation files. Every doc query returns 5 tokens (empty shell).",
     "red"))
 story.append(SP(6))
-cwd = [(W-2*MARGIN)*0.55, (W-2*MARGIN)*0.45]
+cwd = [(CW)*0.55, (CW)*0.45]
 rows_doc = [
     [Paragraph("Doc files in corpus", sBody),          Paragraph("15", sNum)],
     [Paragraph("Total naive tokens", sBody),            Paragraph("63,874", sNum)],
@@ -534,7 +542,7 @@ for i, q in enumerate(t13_qs):
     w  = q.get("winner", "tie")
     winner_style = {"graph": sNumB, "hybrid": sNumG, "raw": sNumA, "tie": sNum}.get(w, sNum)
     rows13.append([
-        Paragraph(q["question"][:70], sBody),
+        Paragraph(trunc(q["question"], 80), sBody),
         Paragraph(f"{gs}/15", sNum),
         Paragraph(f"<b>{hs}/15</b>", sNumG if hs >= gs else sNum),
         Paragraph(f"{rs}/15", sNum),
@@ -545,12 +553,12 @@ if rows13:
     story.append(data_table(
         ["Question", "Graph", "Hybrid", "Raw", "Winner"],
         rows13,
-        col_widths=[W-2*MARGIN-200, 50, 55, 45, 50]
+        col_widths=[CW-200, 50, 55, 45, 50]
     ))
     story.append(SP(6))
 
 # Token comparison
-cw13b = [(W-2*MARGIN)*0.45, (W-2*MARGIN)*0.55]
+cw13b = [(CW)*0.45, (CW)*0.55]
 rows13b = [
     [Paragraph("Avg graph-only context tokens", sBody),  Paragraph(f"{t13_avg.get('graph', 0):,}", sNum)],
     [Paragraph("Avg hybrid context tokens",      sBody),  Paragraph(f"{t13_avg.get('hybrid', 0):,}", sNumG)],
@@ -609,7 +617,7 @@ if t14_data.get("status") == "PASS":
         w  = q.get("winner", "tie")
         wstyle = {"graph": sNumB, "hybrid": sNumB, "wiki": sNumG, "raw": sNumA, "tie": sNum}.get(w, sNum)
         rows14.append([
-            Paragraph(q["question"][:60], sBody),
+            Paragraph(trunc(q["question"], 72), sBody),
             Paragraph(f"{gs}/15", sNum),
             Paragraph(f"{hs}/15", sNum),
             Paragraph(f"<b>{ws}/15</b>", sNumG if ws >= hs else sNum),
@@ -621,12 +629,12 @@ if t14_data.get("status") == "PASS":
         story.append(data_table(
             ["Question", "Graph", "Hybrid", "Wiki", "Raw", "Winner"],
             rows14,
-            col_widths=[W-2*MARGIN-220, 42, 50, 42, 42, 44]
+            col_widths=[CW-220, 42, 50, 42, 42, 44]
         ))
         story.append(SP(6))
 
     # Avg scores comparison bar (table form)
-    cw14b = [(W-2*MARGIN)*0.35, (W-2*MARGIN)*0.20, (W-2*MARGIN)*0.45]
+    cw14b = [(CW)*0.35, (CW)*0.20, (CW)*0.45]
     rows14b = [
         [Paragraph("Graph-only",  sBody), Paragraph(f"{graph_avg}/15",  sNum),
          Paragraph(f"Avg context: {t14_avg.get('graph',0):,} tokens", sSmall)],
@@ -688,7 +696,7 @@ if t15_data.get("status") == "PASS":
             f"{k}({int(v*100)}%)" for k, v in route.get("layers", {}).items()
         )
         rows15.append([
-            Paragraph(q["question"][:55], sBody),
+            Paragraph(trunc(q["question"], 68), sBody),
             Paragraph(route.get("type", "?"), sSmall),
             Paragraph(f"{route.get('budget', 0):,}", sNum),
             Paragraph(f"<b>{rs}/15</b>", sNumG if rs >= bs else sNum),
@@ -700,7 +708,7 @@ if t15_data.get("status") == "PASS":
         story.append(data_table(
             ["Question", "Route Type", "Budget", "Routed", "Raw", "Winner"],
             rows15,
-            col_widths=[W-2*MARGIN-235, 72, 45, 42, 38, 38]
+            col_widths=[CW-230, 72, 45, 40, 36, 37]
         ))
         story.append(SP(6))
 
@@ -723,12 +731,12 @@ if t15_data.get("status") == "PASS":
     story.append(data_table(
         ["Question Type", "Budget", "Layer Allocation"],
         routing_rows,
-        col_widths=[90, 70, W-2*MARGIN-165]
+        col_widths=[90, 70, CW-165]
     ))
     story.append(SP(4))
 
     # Token comparison
-    cw15b = [(W-2*MARGIN)*0.50, (W-2*MARGIN)*0.50]
+    cw15b = [(CW)*0.50, (CW)*0.50]
     rows15b = [
         [Paragraph("Avg routed context tokens", sBody), Paragraph(f"{t15_avg.get('routed',0):,}", sNumG)],
         [Paragraph("Avg raw top-10 tokens",     sBody), Paragraph(f"{t15_avg.get('raw',0):,}", sNum)],
@@ -748,7 +756,7 @@ story.append(alert_box(
     "Hit rate: 89.4% — SHA-256 invalidation is precise, no cascading rebuilds observed.",
     "green"))
 story.append(SP(6))
-cwc = [(W-2*MARGIN)*0.55, (W-2*MARGIN)*0.45]
+cwc = [(CW)*0.55, (CW)*0.45]
 rows_cache = [
     [Paragraph("Files modified", sBody),             Paragraph("5", sNum)],
     [Paragraph("Cache entries reprocessed", sBody),  Paragraph("5  (exactly as expected)", sNumG)],
@@ -789,7 +797,7 @@ for item in avoid_items:
     avoid_content.append([Paragraph(f"<b>✗</b>  {item}", ParagraphStyle("ai", fontName="Helvetica",
                 fontSize=9, textColor=colors.HexColor("#991b1b"), leading=13))])
 
-half = (W - 2*MARGIN - 8) / 2
+half = (CW - 8) / 2
 def box_table(rows, bg, border):
     t = Table(rows, colWidths=[half])
     t.setStyle(TableStyle([
@@ -832,7 +840,7 @@ for scenario, verdict, col in scenarios:
     scenario_rows.append([Paragraph(scenario, sBody), Paragraph(verdict, vs)])
 
 story.append(data_table(["Scenario", "Verdict"], scenario_rows,
-             col_widths=[(W-2*MARGIN)*0.60, (W-2*MARGIN)*0.40]))
+             col_widths=[(CW)*0.60, (CW)*0.40]))
 story.append(SP(10))
 
 # ── Test status ──────────────────────────────────────────────────────────────
@@ -864,7 +872,7 @@ for num, name, status in test_rows:
         Paragraph(badge_text(status), sc),
     ])
 story.append(data_table(["#", "Test Name", "Status"], status_rows,
-             col_widths=[40, W-2*MARGIN-100, 60]))
+             col_widths=[40, CW-100, 60]))
 story.append(SP(12))
 
 # ── Footer ───────────────────────────────────────────────────────────────────

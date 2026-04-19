@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="720" viewBox="0 0 900 720" font-family="'Segoe UI', Arial, sans-serif">
+
+  <!-- Background -->
+  <rect width="900" height="720" fill="#0f172a" rx="12"/>
+
+  <!-- Title -->
+  <text x="450" y="38" text-anchor="middle" font-size="20" font-weight="bold" fill="#f8fafc">PRISM — Pre-compiled Retrieval with Intelligent Strata Management</text>
+  <text x="450" y="58" text-anchor="middle" font-size="12" fill="#94a3b8">Question-routed, adaptive-budget retrieval across 4 knowledge layers</text>
+
+  <!-- ═══ BUILD TIME (left column) ═══ -->
+  <text x="90" y="95" text-anchor="middle" font-size="11" fill="#64748b" font-weight="bold" letter-spacing="2">BUILD ONCE · CACHE</text>
+
+  <!-- Layer 1: Code Graph -->
+  <rect x="20" y="105" width="140" height="90" rx="8" fill="#1e3a5f" stroke="#3b82f6" stroke-width="1.5"/>
+  <text x="90" y="125" text-anchor="middle" font-size="11" font-weight="bold" fill="#93c5fd">Layer 1</text>
+  <text x="90" y="141" text-anchor="middle" font-size="13" font-weight="bold" fill="#bfdbfe">Code Graph</text>
+  <text x="90" y="158" text-anchor="middle" font-size="10" fill="#93c5fd">graphify + tree-sitter</text>
+  <text x="90" y="172" text-anchor="middle" font-size="10" fill="#64748b">AST → graph.json</text>
+  <text x="90" y="186" text-anchor="middle" font-size="10" fill="#22c55e">$0 build cost</text>
+
+  <!-- Layer 2: Doc Index -->
+  <rect x="20" y="215" width="140" height="90" rx="8" fill="#1e3a5f" stroke="#8b5cf6" stroke-width="1.5"/>
+  <text x="90" y="235" text-anchor="middle" font-size="11" font-weight="bold" fill="#c4b5fd">Layer 2</text>
+  <text x="90" y="251" text-anchor="middle" font-size="13" font-weight="bold" fill="#ddd6fe">Doc Index</text>
+  <text x="90" y="268" text-anchor="middle" font-size="10" fill="#c4b5fd">LLM per doc file</text>
+  <text x="90" y="282" text-anchor="middle" font-size="10" fill="#64748b">SHA-256 cached</text>
+  <text x="90" y="296" text-anchor="middle" font-size="10" fill="#fbbf24">~$0.002/doc</text>
+
+  <!-- Layer 3: LLMWiki -->
+  <rect x="20" y="325" width="140" height="90" rx="8" fill="#1e3a5f" stroke="#ec4899" stroke-width="1.5"/>
+  <text x="90" y="345" text-anchor="middle" font-size="11" font-weight="bold" fill="#f9a8d4">Layer 3</text>
+  <text x="90" y="361" text-anchor="middle" font-size="13" font-weight="bold" fill="#fce7f3">LLMWiki</text>
+  <text x="90" y="378" text-anchor="middle" font-size="10" fill="#f9a8d4">7 entity pages</text>
+  <text x="90" y="392" text-anchor="middle" font-size="10" fill="#64748b">code + docs fused</text>
+  <text x="90" y="406" text-anchor="middle" font-size="10" fill="#fbbf24">~$0.004/page</text>
+
+  <!-- Layer 4: BM25 -->
+  <rect x="20" y="435" width="140" height="90" rx="8" fill="#1e3a5f" stroke="#f97316" stroke-width="1.5"/>
+  <text x="90" y="455" text-anchor="middle" font-size="11" font-weight="bold" fill="#fed7aa">Layer 4</text>
+  <text x="90" y="471" text-anchor="middle" font-size="13" font-weight="bold" fill="#ffedd5">BM25</text>
+  <text x="90" y="488" text-anchor="middle" font-size="10" fill="#fed7aa">Term-freq index</text>
+  <text x="90" y="502" text-anchor="middle" font-size="10" fill="#64748b">all sources</text>
+  <text x="90" y="516" text-anchor="middle" font-size="10" fill="#22c55e">$0 build cost</text>
+
+  <!-- ═══ QUERY TIME (centre) ═══ -->
+
+  <!-- User Question box -->
+  <rect x="330" y="105" width="240" height="50" rx="8" fill="#1e293b" stroke="#e2e8f0" stroke-width="1.5"/>
+  <text x="450" y="126" text-anchor="middle" font-size="13" font-weight="bold" fill="#f8fafc">User Question</text>
+  <text x="450" y="145" text-anchor="middle" font-size="10" fill="#94a3b8">"how does AuthService use TokenStore?"</text>
+
+  <!-- Arrow: Question → Router -->
+  <line x1="450" y1="155" x2="450" y2="195" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Router box -->
+  <rect x="300" y="195" width="300" height="110" rx="8" fill="#292524" stroke="#fbbf24" stroke-width="2"/>
+  <text x="450" y="218" text-anchor="middle" font-size="13" font-weight="bold" fill="#fde68a">Question Router</text>
+  <text x="450" y="235" text-anchor="middle" font-size="10" fill="#d97706">1 LLM call · classifies + assigns budget</text>
+  <line x1="310" y1="245" x2="590" y2="245" stroke="#44403c" stroke-width="1"/>
+  <text x="320" y="262" font-size="10" fill="#86efac">structural  → 1,500 tok · graph only</text>
+  <text x="320" y="277" font-size="10" fill="#86efac">rationale   → 2,000 tok · wiki 80% + graph 20%</text>
+  <text x="320" y="292" font-size="10" fill="#86efac">comprehensive → 5,000 tok · all layers</text>
+
+  <!-- Arrows: layers → Router -->
+  <line x1="160" y1="150" x2="300" y2="235" stroke="#3b82f6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowBlue)"/>
+  <line x1="160" y1="260" x2="300" y2="248" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowPurple)"/>
+  <line x1="160" y1="370" x2="300" y2="275" stroke="#ec4899" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowPink)"/>
+  <line x1="160" y1="480" x2="300" y2="295" stroke="#f97316" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arrowOrange)"/>
+
+  <!-- Arrow: Router → Spill box -->
+  <line x1="450" y1="305" x2="450" y2="345" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Adaptive Spill box -->
+  <rect x="310" y="345" width="280" height="70" rx="8" fill="#1c1917" stroke="#a16207" stroke-width="1.5" stroke-dasharray="6,3"/>
+  <text x="450" y="368" text-anchor="middle" font-size="12" font-weight="bold" fill="#fde68a">Adaptive Budget Spill</text>
+  <text x="450" y="386" text-anchor="middle" font-size="10" fill="#d97706">If layer &lt; 30% utilised →</text>
+  <text x="450" y="402" text-anchor="middle" font-size="10" fill="#d97706">carry unused tokens to next layer</text>
+
+  <!-- Arrow: Spill → Context window -->
+  <line x1="450" y1="415" x2="450" y2="455" stroke="#64748b" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <!-- Merged context box -->
+  <rect x="300" y="455" width="300" height="60" rx="8" fill="#14532d" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="450" y="479" text-anchor="middle" font-size="13" font-weight="bold" fill="#bbf7d0">Merged Context Window</text>
+  <text x="450" y="498" text-anchor="middle" font-size="10" fill="#86efac">capped at routed budget · sent to LLM</text>
+
+  <!-- ═══ RESULTS (right column) ═══ -->
+  <text x="790" y="95" text-anchor="middle" font-size="11" fill="#64748b" font-weight="bold" letter-spacing="2">KEY RESULTS</text>
+
+  <!-- Token reduction box -->
+  <rect x="700" y="105" width="180" height="100" rx="8" fill="#1e293b" stroke="#22c55e" stroke-width="1.5"/>
+  <text x="790" y="126" text-anchor="middle" font-size="11" font-weight="bold" fill="#86efac">Token Reduction</text>
+  <text x="790" y="148" text-anchor="middle" font-size="22" font-weight="bold" fill="#4ade80">37.8×</text>
+  <text x="790" y="165" text-anchor="middle" font-size="10" fill="#64748b">graph vs naive (145 files)</text>
+  <text x="790" y="185" text-anchor="middle" font-size="10" fill="#86efac">2.67× vs raw top-10</text>
+
+  <!-- Accuracy box -->
+  <rect x="700" y="225" width="180" height="100" rx="8" fill="#1e293b" stroke="#818cf8" stroke-width="1.5"/>
+  <text x="790" y="246" text-anchor="middle" font-size="11" font-weight="bold" fill="#a5b4fc">PRISM Accuracy</text>
+  <text x="790" y="268" text-anchor="middle" font-size="22" font-weight="bold" fill="#818cf8">13.2</text>
+  <text x="790" y="286" text-anchor="middle" font-size="10" fill="#a5b4fc">out of 15 (LLM judge)</text>
+  <text x="790" y="304" text-anchor="middle" font-size="10" fill="#64748b">raw top-10 = 14.4/15</text>
+
+  <!-- Cost box -->
+  <rect x="700" y="345" width="180" height="100" rx="8" fill="#1e293b" stroke="#fbbf24" stroke-width="1.5"/>
+  <text x="790" y="366" text-anchor="middle" font-size="11" font-weight="bold" fill="#fde68a">Cost Model</text>
+  <text x="790" y="388" text-anchor="middle" font-size="22" font-weight="bold" fill="#fbbf24">15.9×</text>
+  <text x="790" y="406" text-anchor="middle" font-size="10" fill="#fde68a">cheaper than naive</text>
+  <text x="790" y="422" text-anchor="middle" font-size="10" fill="#64748b">break-even ≈ 7.6 queries</text>
+
+  <!-- Cache box -->
+  <rect x="700" y="465" width="180" height="75" rx="8" fill="#1e293b" stroke="#94a3b8" stroke-width="1.5"/>
+  <text x="790" y="486" text-anchor="middle" font-size="11" font-weight="bold" fill="#e2e8f0">Cache Efficiency</text>
+  <text x="790" y="508" text-anchor="middle" font-size="22" font-weight="bold" fill="#cbd5e1">89.4%</text>
+  <text x="790" y="527" text-anchor="middle" font-size="10" fill="#64748b">hit rate (5/47 files changed)</text>
+
+  <!-- Connect merged context to results -->
+  <line x1="600" y1="480" x2="698" y2="210" stroke="#22c55e" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="600" y1="480" x2="698" y2="330" stroke="#818cf8" stroke-width="1" stroke-dasharray="3,3"/>
+
+  <!-- ═══ BOTTOM: Decision legend ═══ -->
+  <rect x="20" y="560" width="860" height="140" rx="8" fill="#1e293b" stroke="#334155" stroke-width="1"/>
+  <text x="450" y="584" text-anchor="middle" font-size="12" font-weight="bold" fill="#e2e8f0">When to use PRISM</text>
+
+  <!-- Use -->
+  <text x="30" y="604" font-size="11" font-weight="bold" fill="#22c55e">USE when:</text>
+  <text x="30" y="620" font-size="10" fill="#86efac">✓  Corpus &gt; 50 files / 20k tokens</text>
+  <text x="30" y="635" font-size="10" fill="#86efac">✓  Will ask &gt; 8 questions on same corpus</text>
+  <text x="30" y="650" font-size="10" fill="#86efac">✓  Mixed code + documentation</text>
+  <text x="30" y="665" font-size="10" fill="#86efac">✓  Architectural / relational questions</text>
+  <text x="30" y="680" font-size="10" fill="#86efac">✓  Cost matters (15.9× savings at scale)</text>
+
+  <!-- Skip -->
+  <text x="240" y="604" font-size="11" font-weight="bold" fill="#ef4444">SKIP when:</text>
+  <text x="240" y="620" font-size="10" fill="#fca5a5">✗  Corpus &lt; 10 files (just read them)</text>
+  <text x="240" y="635" font-size="10" fill="#fca5a5">✗  Need exact line-level implementation details</text>
+  <text x="240" y="650" font-size="10" fill="#fca5a5">✗  Doc-only corpus (use embeddings)</text>
+  <text x="240" y="665" font-size="10" fill="#fca5a5">✗  One-off queries (build cost not amortised)</text>
+
+  <!-- Layer legend -->
+  <text x="480" y="604" font-size="11" font-weight="bold" fill="#94a3b8">Layer coverage:</text>
+  <rect x="480" y="612" width="10" height="10" rx="2" fill="#3b82f6"/>
+  <text x="496" y="621" font-size="10" fill="#93c5fd">Code Graph — structure, calls, imports</text>
+  <rect x="480" y="628" width="10" height="10" rx="2" fill="#8b5cf6"/>
+  <text x="496" y="637" font-size="10" fill="#c4b5fd">Doc Index — markdown summaries, key facts</text>
+  <rect x="480" y="644" width="10" height="10" rx="2" fill="#ec4899"/>
+  <text x="496" y="653" font-size="10" fill="#f9a8d4">LLMWiki — pre-synthesised entity pages</text>
+  <rect x="480" y="660" width="10" height="10" rx="2" fill="#f97316"/>
+  <text x="496" y="669" font-size="10" fill="#fed7aa">BM25 — term-frequency lexical search</text>
+  <text x="480" y="690" font-size="9" fill="#475569">All layers built once · cached by SHA-256 · reused across all queries</text>
+
+  <!-- Arrow markers -->
+  <defs>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#64748b"/>
+    </marker>
+    <marker id="arrowBlue" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#3b82f6"/>
+    </marker>
+    <marker id="arrowPurple" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#8b5cf6"/>
+    </marker>
+    <marker id="arrowPink" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#ec4899"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L8,3 z" fill="#f97316"/>
+    </marker>
+  </defs>
+</svg>

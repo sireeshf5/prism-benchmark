@@ -969,6 +969,11 @@ def router(question: str, client) -> dict:
         }
 
 
+# Fraction of allocated budget a layer must return to be considered useful.
+# Below this threshold the unused tokens spill to the next layer.
+LOW_SIGNAL_THRESHOLD = 0.30
+
+
 def routed_query(
     question: str,
     route: dict,
@@ -980,21 +985,31 @@ def routed_query(
 ) -> tuple[str, int, dict]:
     """Assemble context from the layers specified by *route*, within the route's budget.
 
-    Budget is split proportionally by layer weight. Layers retrieved in descending
+    Budget is split proportionally by layer weight. Layers are retrieved in descending
     weight order so the most important source gets first pick of tokens.
 
+    Adaptive spill: if a layer returns fewer than LOW_SIGNAL_THRESHOLD (30%) of its
+    allocated budget, the unused tokens carry forward to the next layer. This means
+    the system self-corrects when a layer has nothing useful to say — instead of
+    wasting the budget allocation, it gives it to the next best source.
+
     Returns: (merged_context, total_tokens_used, tokens_per_layer)
+    The tokens_per_layer dict includes a 'spill_events' key listing which layers
+    triggered a spill and how many tokens were redistributed.
     """
-    total_budget = route["budget"]
-    layers       = route["layers"]
+    total_budget  = route["budget"]
+    layers        = route["layers"]
     context_parts: list[str] = []
     tokens_per_layer: dict[str, int] = {}
+    spill_events: list[str] = []
+    spill = 0  # unused tokens carried forward from a low-signal layer
 
-    # Sort layers by weight descending — highest priority gets first pick
+    # Sort layers by weight descending — highest priority retrieves first
     for layer_name, weight in sorted(layers.items(), key=lambda x: -x[1]):
         if weight <= 0:
             continue
-        layer_budget = int(total_budget * weight)
+        layer_budget = int(total_budget * weight) + spill
+        spill = 0  # consume the carry-in
 
         if layer_name == "graph":
             ctx = ""
@@ -1038,8 +1053,23 @@ def routed_query(
                 context_parts.append(f"[SEMANTIC SEARCH]\n{ctx}")
             tokens_per_layer["bm25"] = tok
 
-    merged      = "\n\n".join(context_parts)
-    total_used  = sum(tokens_per_layer.values())
+        else:
+            tok = 0
+
+        # ── Adaptive spill ────────────────────────────────────────────────
+        # If this layer returned < 30% of its budget, it had low signal.
+        # Carry unused tokens to the next layer so nothing is wasted.
+        if tok < layer_budget * LOW_SIGNAL_THRESHOLD:
+            unused = layer_budget - tok
+            spill  = unused
+            spill_events.append(
+                f"{layer_name}: used {tok}/{layer_budget} tokens ({tok/max(1,layer_budget):.0%}) "
+                f"→ spilling {unused} to next layer"
+            )
+
+    tokens_per_layer["spill_events"] = spill_events  # type: ignore[assignment]
+    merged     = "\n\n".join(context_parts)
+    total_used = sum(v for k, v in tokens_per_layer.items() if k != "spill_events")
     return merged, total_used, tokens_per_layer
 
 
@@ -2800,6 +2830,7 @@ def test15_routed_system(results: dict) -> dict:
         "total_input_tokens":  0,
         "total_output_tokens": 0,
         "lint_issues":     0,
+        "total_spill_events":  0,
     }
 
     # Count lint issues
@@ -2893,19 +2924,31 @@ def test15_routed_system(results: dict) -> dict:
         elif winner_label == "raw":    t15["raw_wins"]    += 1
         else:                          t15["ties"]        += 1
 
+        spill_events = tok_per_layer.get("spill_events", [])
+        t15["total_spill_events"] += len(spill_events)
+
         entry.update({
             "routed_score": a_s, "raw_score": b_s,
             "winner": winner_label, "comment": comment,
+            "spill_events": spill_events,
         })
         t15["questions"].append(entry)
 
         # Save answer file
-        layer_breakdown = " | ".join(f"{k}:{v}" for k, v in tok_per_layer.items())
+        layer_breakdown = " | ".join(
+            f"{k}:{v}" for k, v in tok_per_layer.items() if k != "spill_events"
+        )
+        spill_note = ""
+        if spill_events:
+            spill_note = "\n**Spill events (adaptive reallocation):**\n" + \
+                         "\n".join(f"  - {e}" for e in spill_events) + "\n"
+
         (ACCURACY_DIR / f"t15_q{i+1:02d}.md").write_text(
             f"# Test15 Q{i+1}: {question}\n\n"
             f"**Route:** {route['type']} | **Budget:** {route['budget']} tokens\n"
             f"**Reason:** {route['reason']}\n"
-            f"**Layer tokens:** {layer_breakdown}\n\n"
+            f"**Layer tokens:** {layer_breakdown}\n"
+            f"{spill_note}\n"
             f"## A: Routed ({routed_tok} tokens) — {a_s}/15\n\n"
             f"{answer_a}\n\n---\n\n"
             f"## B: Raw top-10 ({raw_tok} tokens) — {b_s}/15\n\n"
@@ -2914,8 +2957,9 @@ def test15_routed_system(results: dict) -> dict:
             encoding="utf-8",
         )
 
+        spill_flag = " ↑spill" if spill_events else ""
         print(f"  Q{i+1:<2} {route['type']:<15} {route['budget']:>6}tok "
-              f"{a_s:>7}/15 {b_s:>4}/15  {winner_label}")
+              f"{a_s:>7}/15 {b_s:>4}/15  {winner_label}{spill_flag}")
 
     # Summary
     n_qs = max(1, len(MIXED_QUESTIONS))
@@ -2940,6 +2984,8 @@ def test15_routed_system(results: dict) -> dict:
     print(f"  Avg tokens — routed: {avg['routed']:,} | raw: {avg['raw']:,}")
     print(f"  Token savings vs raw: {t15['token_savings_vs_raw']}x")
     print(f"  Wiki lint issues flagged: {t15['lint_issues']}")
+    print(f"  Adaptive spill events:   {t15['total_spill_events']} "
+          f"(layers that had low signal and redistributed budget)")
     print(f"  Judge cost: ${judge_cost:.4f}")
     print(f"\n  Answer files: {ACCURACY_DIR}/t15_q*.md")
     if lint_path.exists():
